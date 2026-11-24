@@ -16,6 +16,7 @@ struct AERConfig {
     bool enableJsonTelemetry = true;
     bool selectiveOverride = true;
     bool forceOverrideAll = false;
+    bool enable32BitFloatImport = false; // Default false: keeps 10-bit HDR on 33MB GPU VideoProcessor BGRA8 instead of 132MB float32!
     // Lean VRAM & RAM cache budgets (Premiere caches rendered PPix frames independently)
     uint32_t maxPercentVramBudget = 78;
     uint32_t maxVramCacheMB = 384;

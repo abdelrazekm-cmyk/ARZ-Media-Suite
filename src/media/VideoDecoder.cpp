@@ -480,12 +480,8 @@ bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta,
     publishTelemetryLocked();
 
     if (!lowResourceThumbMode_) {
-        const PixelBufferFormat defaultFmt =
-            (usingHardware_ && !meta_.hasAlpha && (meta_.width % 2 == 0) && (meta_.height % 2 == 0))
-                ? (meta_.bitDepth > 8 ? PixelBufferFormat::P010_10u : PixelBufferFormat::NV12_8u)
-                : PixelBufferFormat::BGRA_8u;
         materializeAndCacheFrameLocked(probed, 0, meta_.width, meta_.height,
-                                       0, defaultFmt, nullptr, false);
+                                       0, PixelBufferFormat::BGRA_8u, nullptr, false);
     }
 
     av_frame_free(&probed);

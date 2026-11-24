@@ -270,10 +270,10 @@ int wmain(int argc, wchar_t* argv[]) {
             return 30;
         }
         const auto& m = session.metadata();
-        const aer::PixelBufferFormat nativeFmt =
-            (m.bitDepth > 8) ? aer::PixelBufferFormat::P010_10u : aer::PixelBufferFormat::NV12_8u;
-        const int nativeStride = m.width * (m.bitDepth > 8 ? 2 : 1);
-        std::vector<uint8_t> yuvBuf(aer::estimateTightFrameBytes(m.width, m.height, nativeFmt));
+        // Test exact Premiere PPix path: 100% GPU VideoProcessorBlt (P010/NV12 -> BGRA8) + GOP Lookahead!
+        const aer::PixelBufferFormat nativeFmt = aer::PixelBufferFormat::BGRA_8u;
+        const int nativeStride = m.width * 4;
+        std::vector<uint8_t> yuvBuf(static_cast<size_t>(nativeStride) * static_cast<size_t>(m.height));
 
         // 3A. Test scrub cancellation NEVER drops GPU session to CPU!
         const uint64_t staleGen = session.currentScrubGeneration();

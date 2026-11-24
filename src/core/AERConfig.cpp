@@ -54,6 +54,7 @@ AERConfig loadConfigFromDisk() {
         else if (key == "enablejsontelemetry") cfg.enableJsonTelemetry = (val == "1" || val == "true");
         else if (key == "selectiveoverride") cfg.selectiveOverride = (val == "1" || val == "true");
         else if (key == "forceoverrideall") cfg.forceOverrideAll = (val == "1" || val == "true");
+        else if (key == "enable32bitfloatimport") cfg.enable32BitFloatImport = (val == "1" || val == "true");
         else if (key == "maxpercentvrambudget") cfg.maxPercentVramBudget = static_cast<uint32_t>(std::stoul(val));
         else if (key == "maxvramcachemb") cfg.maxVramCacheMB = static_cast<uint32_t>(std::stoul(val));
         else if (key == "maxramcachemb" || key == "maxframecachemb") cfg.maxRamCacheMB = static_cast<uint32_t>(std::stoul(val));

@@ -95,7 +95,7 @@ void AERTelemetry::flushJsonLocked(uint32_t activeGpuStreams) {
 
     out << "{\n"
         << "  \"plugin\": \"ARZ\",\n"
-        << "  \"version\": \"1.2.0\",\n"
+        << "  \"version\": \"1.2.1\",\n"
         << "  \"process_id\": " << currentPid() << ",\n"
         << "  \"updated_at_ms\": " << nowMs << ",\n"
         << "  \"gpu_adapter\": \"" << jsonEscape(gpuMgr.adapterName()) << "\",\n"

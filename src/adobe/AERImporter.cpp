@@ -1,3 +1,4 @@
+#include "core/AERConfig.hpp"
 #include "core/AERSession.hpp"
 
 #ifndef PRWIN_ENV
@@ -213,7 +214,7 @@ aer::PixelBufferFormat mapPrFormatToAer(PrPixelFormat fmt) noexcept {
 
 void negotiateFrameFormat(const imSourceVideoRec* videoRec,
                           const aer::MediaMetadata& meta,
-                          bool usingHw,
+                          bool /*usingHw*/,
                           PrPixelFormat& outChosenFormat,
                           int& outDstW,
                           int& outDstH) {
@@ -221,47 +222,32 @@ void negotiateFrameFormat(const imSourceVideoRec* videoRec,
     outDstW = meta.width;
     outDstH = meta.height;
 
-    const bool allowBiPlanar = usingHw && !meta.hasAlpha && meta.rotationDegrees != 180 &&
-                               (meta.width & 1) == 0 && (meta.height & 1) == 0;
+    const bool allow32f = aer::AERConfig::instance().enable32BitFloatImport || (meta.hasAlpha && meta.bitDepth > 8);
 
     if (videoRec && videoRec->inNumFrameFormats > 0 && videoRec->inFrameFormats) {
         bool matchedExplicit = false;
+        // Pass 1: Prefer BGRA_4444_8u (100% GPU VideoProcessorBlt on NV12 & 10-bit P010, 4x smaller than 32f, guaranteed GetPixels!)
         for (csSDK_int32 i = 0; i < videoRec->inNumFrameFormats; ++i) {
             const auto& cand = videoRec->inFrameFormats[i];
-            const int cw = cand.inFrameWidth > 0 ? cand.inFrameWidth : meta.width;
-            const int ch = cand.inFrameHeight > 0 ? cand.inFrameHeight : meta.height;
-
-            if (cand.inPixelFormat == PrPixelFormat_Any) {
-                const PrPixelFormat bp = selectPreferredBiPlanarFormat(meta, usingHw);
-                if (bp != PrPixelFormat_Invalid && cw == meta.width && ch == meta.height) {
-                    outChosenFormat = bp;
-                } else {
-                    outChosenFormat = PrPixelFormat_BGRA_4444_8u;
-                }
-                outDstW = cw;
-                outDstH = ch;
+            if (cand.inPixelFormat == PrPixelFormat_BGRA_4444_8u || cand.inPixelFormat == PrPixelFormat_Any) {
+                outChosenFormat = PrPixelFormat_BGRA_4444_8u;
+                outDstW = cand.inFrameWidth > 0 ? cand.inFrameWidth : meta.width;
+                outDstH = cand.inFrameHeight > 0 ? cand.inFrameHeight : meta.height;
                 matchedExplicit = true;
                 break;
             }
-
-            if (allowBiPlanar && cw == meta.width && ch == meta.height) {
-                if ((meta.bitDepth > 8 && isPrP010Format(cand.inPixelFormat)) ||
-                    (meta.bitDepth <= 8 && isPrNv12Format(cand.inPixelFormat))) {
-                    outChosenFormat = cand.inPixelFormat;
-                    outDstW = cw;
-                    outDstH = ch;
+        }
+        // Pass 2: Accept BGRA_4444_32f whenever BGRA_4444_8u was not in the host's requested list (e.g. AE 32bpc)
+        if (!matchedExplicit) {
+            for (csSDK_int32 i = 0; i < videoRec->inNumFrameFormats; ++i) {
+                const auto& cand = videoRec->inFrameFormats[i];
+                if (cand.inPixelFormat == PrPixelFormat_BGRA_4444_32f) {
+                    outChosenFormat = PrPixelFormat_BGRA_4444_32f;
+                    outDstW = cand.inFrameWidth > 0 ? cand.inFrameWidth : meta.width;
+                    outDstH = cand.inFrameHeight > 0 ? cand.inFrameHeight : meta.height;
                     matchedExplicit = true;
                     break;
                 }
-            }
-
-            if (cand.inPixelFormat == PrPixelFormat_BGRA_4444_8u ||
-                cand.inPixelFormat == PrPixelFormat_BGRA_4444_32f) {
-                outChosenFormat = cand.inPixelFormat;
-                outDstW = cw;
-                outDstH = ch;
-                matchedExplicit = true;
-                break;
             }
         }
         if (!matchedExplicit) {
@@ -731,34 +717,18 @@ prMALError handleGetIndFormat(csSDK_size_t index, imIndFormatRec* rec) {
 prMALError handleGetIndPixelFormat(csSDK_size_t index, imIndPixelFormatRec* rec) {
     if (!rec) return imOtherErr;
 
-    AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(rec->privatedata);
-    aer::AERSession* sess = (h && *h) ? (*h)->session() : nullptr;
-
-    std::vector<PrPixelFormat> supported;
-    supported.reserve(4);
-
-    if (sess && sess->metadata().hasVideo) {
-        const auto& meta = sess->metadata();
-        const PrPixelFormat biPlanar = selectPreferredBiPlanarFormat(meta, sess->isUsingHardwareDecode());
-        if (biPlanar != PrPixelFormat_Invalid) {
-            supported.push_back(biPlanar); // Priority #1: Zero-CPU Native NV12 / P010!
-        }
-        supported.push_back(PrPixelFormat_BGRA_4444_8u); // Priority #2: GPU-converted BGRA8 (scaled/AE)
-        if (meta.bitDepth > 8) {
-            supported.push_back(PrPixelFormat_BGRA_4444_32f); // Priority #3: GPU RGBA16 -> BGRA32f (AE 32bpc)
-        }
-    } else {
-        supported.push_back(PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_709);
-        supported.push_back(PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_709);
-        supported.push_back(PrPixelFormat_BGRA_4444_8u);
-        supported.push_back(PrPixelFormat_BGRA_4444_32f);
+    // PrSDKPPixSuite::GetPixels ONLY exposes packed single-plane buffers (not internal Adobe BIPLANAR NV12/P010).
+    // Advertising PrPixelFormat_BGRA_4444_8u runs 100% on GPU (NVDEC P010/NV12 -> D3D11 VideoProcessorBlt BGRA8)
+    // with ZERO CPU swscale, 4x less PCIe/RAM bandwidth than 32-bit float, and 100% compatibility in Premiere, AME & AE!
+    if (index == 0) {
+        rec->outPixelFormat = PrPixelFormat_BGRA_4444_8u;
+        return malNoError;
     }
-
-    if (index >= supported.size()) {
-        return imBadFormatIndex;
+    if (index == 1 && aer::AERConfig::instance().enable32BitFloatImport) {
+        rec->outPixelFormat = PrPixelFormat_BGRA_4444_32f;
+        return malNoError;
     }
-    rec->outPixelFormat = supported[index];
-    return malNoError;
+    return imBadFormatIndex;
 }
 
 prMALError ensureInstanceAndSession(imStdParms* stdParms,
