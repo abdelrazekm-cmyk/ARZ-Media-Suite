@@ -1,16 +1,16 @@
 <div align="center">
   <img src="resources/arz_logo.jpg" alt="ARZ Media Suite Logo" width="320"/>
-  <h1>ARZ Media Suite v1.1.0</h1>
-  <p><b>Native High-Performance AV1 / MKV / WebM / ProRes Importer & 300+ FPS Turbo RTX Exporter for Adobe Premiere Pro 2027 & Media Encoder</b></p>
+  <h1>ARZ Media Suite v1.2.0</h1>
+  <p><b>Zero-CPU Native P010/NV12 GPU Importer & 300+ FPS Turbo RTX Exporter for Adobe Premiere Pro, Media Encoder & After Effects</b></p>
 </div>
 
 ---
 
 ## Overview | نظرة عامة
 
-**ARZ Media Suite (`v1.1.0`)** is a standalone, zero-dependency Windows x64 C++20 MediaCore suite built with **static C++ runtime (`/MT`)** and **FFmpeg 9.1+**, delivering DaVinci Resolve-class timeline scrubbing, lean recycled **D3D11 VRAM Texture Pooling** (`384 MB` cap, zero PCIe spillover), and **`302+ FPS` Zero-Swscale Async `Ctrl+M` Exporting** directly inside **Adobe Premiere Pro 2027**.
+**ARZ Media Suite (`v1.2.0`)** is a standalone, zero-dependency Windows x64 C++20 MediaCore suite built with **static C++ runtime (`/MT`)** and **FFmpeg 9.1+**, delivering **Zero-CPU Native Bi-Planar `NV12` & `P010` GPU frame delivery**, DaVinci Resolve-style **Continuous GOP Lookahead Prefetch**, shared **`MediaCore` integration across Premiere Pro, Media Encoder, and After Effects**, and **`302+ FPS` Zero-Swscale Async Exporting**.
 
-حزمة **`ARZ Media Suite v1.1.0`** هي إضافة مستقلة بالكامل لبرنامج **Adobe Premiere Pro 2027** و**Media Encoder** بدون أي متطلبات خارجية على جهاز العميل (`Zero External Dependencies`)، تجمع بين مستورد مزدوج الأولوية لـ **59 صيغة ميديا** باستهلاك ذاكرة منخفض للغاية، ومصدّر فائق السرعة داخل **`Ctrl+M`** بـ **12 إعداد مسبق (`ARZ Presets`)**، ومثبّت رسومي يعرض **سجل التثبيت المباشر لحظة بلحظة**.
+حزمة **`ARZ Media Suite v1.2.0`** هي إضافة مستقلة بالكامل لبرامج **Adobe Premiere Pro** و**Media Encoder** و**After Effects** عبر مسار **`MediaCore\ARZ`** الموحد بدون أي متطلبات خارجية، مع تسليم عتادي مباشر بصيغ **`NV12` و`P010`** لتصفير استهلاك المعالج على التايملاين، وتحضير مسبق مستمر للفريمات (`GOP Lookahead`)، ومصدّر فائق السرعة (`300+ FPS`).
 
 ---
 
@@ -33,7 +33,7 @@
 ## Quick Client Installation | التثبيت السريع للعميل
 
 1. Close **Adobe Premiere Pro** and **Adobe Media Encoder**.
-2. Download and run **`ARZ-PremierePlugin-v1.1.0-Windows-x64-Setup.exe`** from **Releases** (100% self-contained with live visual verification log — no VC++ Redistributable, Python, or external FFmpeg installation required!).
+2. Download and run **`ARZ-PremierePlugin-v1.2.0-Windows-x64-Setup.exe`** from **Releases** (100% self-contained with live visual verification log — automatically installs into shared `MediaCore\ARZ` for Premiere Pro, Media Encoder & After Effects!).
 3. Launch **Premiere Pro** — import any file onto the timeline or press **`Ctrl+M`** and select any **`ARZ - ...`** format!
 
 ---

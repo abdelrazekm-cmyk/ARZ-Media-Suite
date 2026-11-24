@@ -89,9 +89,14 @@ struct AERInstanceRec {
     PrSDKPPixCreatorSuite* ppixCreatorSuite = nullptr;
     PrSDKPPixCacheSuite* ppixCacheSuite = nullptr;
     PrSDKPPixSuite* ppixSuite = nullptr;
+    PrSDKPPix2Suite* ppix2Suite = nullptr;
     PrSDKTimeSuite* timeSuite = nullptr;
     PrSDKStringSuite* stringSuite = nullptr;
-    aer::AERSession* session = nullptr;
+    std::shared_ptr<aer::AERSession>* sessionHolder = nullptr;
+
+    aer::AERSession* session() const noexcept {
+        return (sessionHolder && *sessionHolder) ? sessionHolder->get() : nullptr;
+    }
 
     void acquireSuites(imStdParms* stdParms) {
         if (!stdParms || !stdParms->piSuites || !stdParms->piSuites->utilFuncs) return;
@@ -110,6 +115,10 @@ struct AERInstanceRec {
         if (!ppixSuite) {
             basicSuite->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion,
                                      const_cast<const void**>(reinterpret_cast<void**>(&ppixSuite)));
+        }
+        if (!ppix2Suite) {
+            basicSuite->AcquireSuite(kPrSDKPPix2Suite, kPrSDKPPix2SuiteVersion,
+                                     const_cast<const void**>(reinterpret_cast<void**>(&ppix2Suite)));
         }
         if (!timeSuite) {
             basicSuite->AcquireSuite(kPrSDKTimeSuite, kPrSDKTimeSuiteVersion,
@@ -135,6 +144,10 @@ struct AERInstanceRec {
             basicSuite->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
             ppixSuite = nullptr;
         }
+        if (ppix2Suite) {
+            basicSuite->ReleaseSuite(kPrSDKPPix2Suite, kPrSDKPPix2SuiteVersion);
+            ppix2Suite = nullptr;
+        }
         if (timeSuite) {
             basicSuite->ReleaseSuite(kPrSDKTimeSuite, kPrSDKTimeSuiteVersion);
             timeSuite = nullptr;
@@ -153,8 +166,54 @@ std::wstring prUtf16ToWide(const prUTF16Char* p) {
     return std::wstring(reinterpret_cast<const wchar_t*>(p));
 }
 
+bool isPrNv12Format(PrPixelFormat fmt) noexcept {
+    return fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_709 ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_709_FullRange ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_601 ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_601_FullRange;
+}
+
+bool isPrP010Format(PrPixelFormat fmt) noexcept {
+    return fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_709 ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_709_FullRange ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020 ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_FullRange ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_HDR ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_HDR_FullRange ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_HDR_HLG ||
+           fmt == PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_HDR_HLG_FullRange;
+}
+
+PrPixelFormat selectPreferredBiPlanarFormat(const aer::MediaMetadata& meta, bool usingHw) noexcept {
+    if (!usingHw || meta.hasAlpha || meta.rotationDegrees == 180 ||
+        meta.width <= 0 || meta.height <= 0 || (meta.width & 1) != 0 || (meta.height & 1) != 0) {
+        return PrPixelFormat_Invalid;
+    }
+    if (meta.bitDepth > 8) {
+        if (meta.isHdr && meta.isBt2020) {
+            return PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020_HDR;
+        }
+        if (meta.isBt2020) {
+            return PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_2020;
+        }
+        return PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_709;
+    }
+    if (meta.isBt601) {
+        return PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_601;
+    }
+    return PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_709;
+}
+
+aer::PixelBufferFormat mapPrFormatToAer(PrPixelFormat fmt) noexcept {
+    if (isPrP010Format(fmt)) return aer::PixelBufferFormat::P010_10u;
+    if (isPrNv12Format(fmt)) return aer::PixelBufferFormat::NV12_8u;
+    if (fmt == PrPixelFormat_BGRA_4444_32f) return aer::PixelBufferFormat::BGRA_32f;
+    return aer::PixelBufferFormat::BGRA_8u;
+}
+
 void negotiateFrameFormat(const imSourceVideoRec* videoRec,
                           const aer::MediaMetadata& meta,
+                          bool usingHw,
                           PrPixelFormat& outChosenFormat,
                           int& outDstW,
                           int& outDstH) {
@@ -162,15 +221,45 @@ void negotiateFrameFormat(const imSourceVideoRec* videoRec,
     outDstW = meta.width;
     outDstH = meta.height;
 
+    const bool allowBiPlanar = usingHw && !meta.hasAlpha && meta.rotationDegrees != 180 &&
+                               (meta.width & 1) == 0 && (meta.height & 1) == 0;
+
     if (videoRec && videoRec->inNumFrameFormats > 0 && videoRec->inFrameFormats) {
         bool matchedExplicit = false;
         for (csSDK_int32 i = 0; i < videoRec->inNumFrameFormats; ++i) {
             const auto& cand = videoRec->inFrameFormats[i];
+            const int cw = cand.inFrameWidth > 0 ? cand.inFrameWidth : meta.width;
+            const int ch = cand.inFrameHeight > 0 ? cand.inFrameHeight : meta.height;
+
+            if (cand.inPixelFormat == PrPixelFormat_Any) {
+                const PrPixelFormat bp = selectPreferredBiPlanarFormat(meta, usingHw);
+                if (bp != PrPixelFormat_Invalid && cw == meta.width && ch == meta.height) {
+                    outChosenFormat = bp;
+                } else {
+                    outChosenFormat = PrPixelFormat_BGRA_4444_8u;
+                }
+                outDstW = cw;
+                outDstH = ch;
+                matchedExplicit = true;
+                break;
+            }
+
+            if (allowBiPlanar && cw == meta.width && ch == meta.height) {
+                if ((meta.bitDepth > 8 && isPrP010Format(cand.inPixelFormat)) ||
+                    (meta.bitDepth <= 8 && isPrNv12Format(cand.inPixelFormat))) {
+                    outChosenFormat = cand.inPixelFormat;
+                    outDstW = cw;
+                    outDstH = ch;
+                    matchedExplicit = true;
+                    break;
+                }
+            }
+
             if (cand.inPixelFormat == PrPixelFormat_BGRA_4444_8u ||
                 cand.inPixelFormat == PrPixelFormat_BGRA_4444_32f) {
                 outChosenFormat = cand.inPixelFormat;
-                outDstW = cand.inFrameWidth > 0 ? cand.inFrameWidth : meta.width;
-                outDstH = cand.inFrameHeight > 0 ? cand.inFrameHeight : meta.height;
+                outDstW = cw;
+                outDstH = ch;
                 matchedExplicit = true;
                 break;
             }
@@ -188,6 +277,7 @@ void negotiateFrameFormat(const imSourceVideoRec* videoRec,
 prMALError populatePPixFromSession(aer::AERSession* session,
                                    PrSDKPPixCreatorSuite* creatorSuite,
                                    PrSDKPPixSuite* ppixSuite,
+                                   PrSDKPPix2Suite* ppix2Suite,
                                    PrSDKPPixCacheSuite* cacheSuite,
                                    csSDK_int32 importerID,
                                    int64_t frameNumber,
@@ -218,14 +308,20 @@ prMALError populatePPixFromSession(aer::AERSession* session,
     PrPixelFormat chosenFormat = PrPixelFormat_BGRA_4444_8u;
     int dstW = meta.width;
     int dstH = meta.height;
-    negotiateFrameFormat(videoRec, meta, chosenFormat, dstW, dstH);
+    negotiateFrameFormat(videoRec, meta, session->isUsingHardwareDecode(), chosenFormat, dstW, dstH);
 
     prRect bounds{};
     prSetRect(&bounds, 0, 0, dstW, dstH);
     if (creatorSuite->CreatePPix(
             videoRec->outFrame, PrPPixBufferAccess_ReadWrite, chosenFormat, &bounds) != suiteError_NoError ||
         !*videoRec->outFrame) {
-        return imMemErr;
+        // Fallback to BGRA_4444_8u if host doesn't support creating a bi-planar PPix directly
+        chosenFormat = PrPixelFormat_BGRA_4444_8u;
+        if (creatorSuite->CreatePPix(
+                videoRec->outFrame, PrPPixBufferAccess_ReadWrite, chosenFormat, &bounds) != suiteError_NoError ||
+            !*videoRec->outFrame) {
+            return imMemErr;
+        }
     }
 
     char* dstPixels = nullptr;
@@ -233,17 +329,31 @@ prMALError populatePPixFromSession(aer::AERSession* session,
     ppixSuite->GetPixels(*videoRec->outFrame, PrPPixBufferAccess_ReadWrite, &dstPixels);
     ppixSuite->GetRowBytes(*videoRec->outFrame, &rowBytes);
 
-    const aer::PixelBufferFormat aerFmt =
-        (chosenFormat == PrPixelFormat_BGRA_4444_32f)
-            ? aer::PixelBufferFormat::BGRA_32f
-            : aer::PixelBufferFormat::BGRA_8u;
+    aer::PixelBufferFormat aerFmt = mapPrFormatToAer(chosenFormat);
 
-    // Premiere PPix BGRA_4444_8u / 32f uses standard Windows bottom-up DIB scanline ordering
-    // (row 0 = bottom line of frame when rowBytes > 0; top line when rowBytes < 0).
-    // Combined with container rotationDegrees == 180 if present:
-    const bool ppixIsBottomUp = (rowBytes > 0);
+    // Safety guard: verify bi-planar PPix allocated enough space for Y + UV planes (3/2 * height * abs(rowBytes))
+    if ((aerFmt == aer::PixelBufferFormat::NV12_8u || aerFmt == aer::PixelBufferFormat::P010_10u) && ppix2Suite) {
+        size_t ppixBytes = 0;
+        const size_t minBiPlanar = (static_cast<size_t>(std::abs(rowBytes)) * static_cast<size_t>(dstH) * 3ULL) / 2ULL;
+        if (ppix2Suite->GetSize(*videoRec->outFrame, &ppixBytes) == suiteError_NoError && ppixBytes < minBiPlanar) {
+            ppixSuite->Dispose(*videoRec->outFrame);
+            *videoRec->outFrame = nullptr;
+            chosenFormat = PrPixelFormat_BGRA_4444_8u;
+            aerFmt = aer::PixelBufferFormat::BGRA_8u;
+            if (creatorSuite->CreatePPix(
+                    videoRec->outFrame, PrPPixBufferAccess_ReadWrite, chosenFormat, &bounds) != suiteError_NoError ||
+                !*videoRec->outFrame) {
+                return imMemErr;
+            }
+            ppixSuite->GetPixels(*videoRec->outFrame, PrPPixBufferAccess_ReadWrite, &dstPixels);
+            ppixSuite->GetRowBytes(*videoRec->outFrame, &rowBytes);
+        }
+    }
+
+    const bool isBiPlanarYuv = (aerFmt == aer::PixelBufferFormat::NV12_8u || aerFmt == aer::PixelBufferFormat::P010_10u);
+    const bool ppixIsBottomUp = !isBiPlanarYuv && (rowBytes > 0);
     const bool mediaRotated180 = (meta.rotationDegrees == 180);
-    const bool flipVertical = (ppixIsBottomUp != mediaRotated180);
+    const bool flipVertical = isBiPlanarYuv ? false : (ppixIsBottomUp != mediaRotated180);
 
     if (!dstPixels || rowBytes == 0 ||
         !session->renderVideoFrame(
@@ -267,15 +377,14 @@ prMALError populatePPixFromSession(aer::AERSession* session,
 }
 
 // =========================================================================================
-// DaVinci Resolve-Class Asynchronous Importer (Latest-Wins Background Prefetch + Cancel)
+// DaVinci Resolve-Class Asynchronous Importer (Shared Session + Zero-Readback VRAM Warm)
 // =========================================================================================
 class AERAsyncImporter {
 public:
     AERAsyncImporter(SPBasicSuite* basic,
                      csSDK_int32 importerID,
-                     const std::wstring& filePath,
-                     bool highPriority)
-        : basicSuite_(basic), importerID_(importerID) {
+                     std::shared_ptr<aer::AERSession> sharedSession)
+        : basicSuite_(basic), importerID_(importerID), session_(std::move(sharedSession)) {
         if (basicSuite_) {
             basicSuite_->AcquireSuite(kPrSDKPPixCreatorSuite, kPrSDKPPixCreatorSuiteVersion,
                                       const_cast<const void**>(reinterpret_cast<void**>(&ppixCreatorSuite_)));
@@ -283,11 +392,12 @@ public:
                                       const_cast<const void**>(reinterpret_cast<void**>(&ppixCacheSuite_)));
             basicSuite_->AcquireSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion,
                                       const_cast<const void**>(reinterpret_cast<void**>(&ppixSuite_)));
+            basicSuite_->AcquireSuite(kPrSDKPPix2Suite, kPrSDKPPix2SuiteVersion,
+                                      const_cast<const void**>(reinterpret_cast<void**>(&ppix2Suite_)));
             basicSuite_->AcquireSuite(kPrSDKTimeSuite, kPrSDKTimeSuiteVersion,
                                       const_cast<const void**>(reinterpret_cast<void**>(&timeSuite_)));
         }
-        session_ = std::make_unique<aer::AERSession>();
-        valid_ = session_->open(filePath, highPriority);
+        valid_ = (session_ != nullptr);
         if (valid_) {
             worker_ = std::thread(&AERAsyncImporter::workerLoop, this);
         }
@@ -295,14 +405,12 @@ public:
 
     ~AERAsyncImporter() {
         shutdownWorker();
-        if (session_) {
-            session_->close();
-            session_.reset();
-        }
+        session_.reset(); // Shared session stays alive for parent AERInstanceRec until imCloseFile!
         if (basicSuite_) {
             if (ppixCreatorSuite_) basicSuite_->ReleaseSuite(kPrSDKPPixCreatorSuite, kPrSDKPPixCreatorSuiteVersion);
             if (ppixCacheSuite_) basicSuite_->ReleaseSuite(kPrSDKPPixCacheSuite, kPrSDKPPixCacheSuiteVersion);
             if (ppixSuite_) basicSuite_->ReleaseSuite(kPrSDKPPixSuite, kPrSDKPPixSuiteVersion);
+            if (ppix2Suite_) basicSuite_->ReleaseSuite(kPrSDKPPix2Suite, kPrSDKPPix2SuiteVersion);
             if (timeSuite_) basicSuite_->ReleaseSuite(kPrSDKTimeSuite, kPrSDKTimeSuiteVersion);
         }
     }
@@ -353,19 +461,14 @@ public:
         PrPixelFormat chosenFmt = PrPixelFormat_BGRA_4444_8u;
         int dstW = session_->metadata().width;
         int dstH = session_->metadata().height;
-        negotiateFrameFormat(&srcRec, session_->metadata(), chosenFmt, dstW, dstH);
+        negotiateFrameFormat(&srcRec, session_->metadata(), session_->isUsingHardwareDecode(), chosenFmt, dstW, dstH);
 
-        const aer::PixelBufferFormat aerFmt =
-            (chosenFmt == PrPixelFormat_BGRA_4444_32f)
-                ? aer::PixelBufferFormat::BGRA_32f
-                : aer::PixelBufferFormat::BGRA_8u;
-
+        const aer::PixelBufferFormat aerFmt = mapPrFormatToAer(chosenFmt);
         const aer::FrameCacheKey ckey{session_->sessionId(), frameNum, dstW, dstH, aerFmt};
         if (aer::LRUFrameCache::instance().hasCachedFrame(ckey)) {
             return aiNoError;
         }
 
-        // Latest-Wins Queue: bump scrub generation so any obsolete Long-GOP decode aborts immediately!
         const uint64_t gen = session_->bumpScrubGeneration();
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
@@ -400,7 +503,7 @@ public:
         const int64_t frameNum = timeToFrame(getRec->inFrameTime);
 
         const prMALError err = populatePPixFromSession(
-            session_.get(), ppixCreatorSuite_, ppixSuite_, ppixCacheSuite_,
+            session_.get(), ppixCreatorSuite_, ppixSuite_, ppix2Suite_, ppixCacheSuite_,
             importerID_, frameNum, getRec, /*fastKeyframeScrub=*/false, /*expectedGeneration=*/0);
         return (err == malNoError) ? aiNoError : aiFrameNotFound;
     }
@@ -436,7 +539,6 @@ private:
     }
 
     void workerLoop() {
-        std::vector<uint8_t> scratch;
         while (true) {
             AsyncJob job{};
             {
@@ -448,20 +550,14 @@ private:
                 workerBusy_ = true;
             }
 
-            const size_t pixelBytes = static_cast<size_t>(job.width) * static_cast<size_t>(job.height) *
-                                      (job.format == aer::PixelBufferFormat::BGRA_32f ? 16ULL : 4ULL);
-            if (scratch.size() < pixelBytes) {
-                scratch.resize(pixelBytes);
-            }
-
-            // Decode directly into AER's VRAM/RAM cache (aborts mid-GOP if superseded by newer generation!)
+            // Cache-Only VRAM Warm (`outPixels = nullptr`): ZERO wasted PCIe readback!
             session_->renderVideoFrame(
                 job.frameNumber,
                 job.width,
                 job.height,
-                job.width * (job.format == aer::PixelBufferFormat::BGRA_32f ? 16 : 4),
+                0,
                 job.format,
-                scratch.data(),
+                nullptr,
                 /*flipVertical=*/false,
                 /*fastKeyframeScrub=*/false,
                 job.generation);
@@ -478,9 +574,10 @@ private:
     PrSDKPPixCreatorSuite* ppixCreatorSuite_ = nullptr;
     PrSDKPPixCacheSuite* ppixCacheSuite_ = nullptr;
     PrSDKPPixSuite* ppixSuite_ = nullptr;
+    PrSDKPPix2Suite* ppix2Suite_ = nullptr;
     PrSDKTimeSuite* timeSuite_ = nullptr;
     csSDK_int32 importerID_ = 0;
-    std::unique_ptr<aer::AERSession> session_;
+    std::shared_ptr<aer::AERSession> session_;
     bool valid_ = false;
 
     std::mutex queueMutex_;
@@ -526,7 +623,7 @@ PREMPLUGENTRY xAERAsyncImportEntry(int inSelector, void* inParam) {
         }
         case aiGetMinPlaybackSpeedForSelectingEfficientTime: {
             auto* spd = reinterpret_cast<aiGetMinPlaybackSpeedForSelectingEfficientTimeRec*>(inParam);
-            if (spd) spd->outPlaybackSpeed = 1.5;
+            if (spd) spd->outPlaybackSpeed = 1.25;
             return aiNoError;
         }
         default:
@@ -537,15 +634,14 @@ PREMPLUGENTRY xAERAsyncImportEntry(int inSelector, void* inParam) {
 prMALError handleCreateAsyncImporter(imAsyncImporterCreationRec* asyncRec) {
     if (!asyncRec) return imOtherErr;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(asyncRec->inPrivateData);
-    if (!h || !*h || !(*h)->session || !(*h)->basicSuite) {
+    if (!h || !*h || !(*h)->sessionHolder || !*((*h)->sessionHolder) || !(*h)->basicSuite) {
         return imOtherErr;
     }
 
     auto* asyncImp = new AERAsyncImporter(
         (*h)->basicSuite,
         (*h)->importerID,
-        (*h)->session->filePath(),
-        (*h)->highPriority);
+        *((*h)->sessionHolder));
     if (!asyncImp->isValid()) {
         delete asyncImp;
         return imOtherErr;
@@ -634,15 +730,35 @@ prMALError handleGetIndFormat(csSDK_size_t index, imIndFormatRec* rec) {
 
 prMALError handleGetIndPixelFormat(csSDK_size_t index, imIndPixelFormatRec* rec) {
     if (!rec) return imOtherErr;
-    if (index == 0) {
-        rec->outPixelFormat = PrPixelFormat_BGRA_4444_8u;
-        return malNoError;
+
+    AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(rec->privatedata);
+    aer::AERSession* sess = (h && *h) ? (*h)->session() : nullptr;
+
+    std::vector<PrPixelFormat> supported;
+    supported.reserve(4);
+
+    if (sess && sess->metadata().hasVideo) {
+        const auto& meta = sess->metadata();
+        const PrPixelFormat biPlanar = selectPreferredBiPlanarFormat(meta, sess->isUsingHardwareDecode());
+        if (biPlanar != PrPixelFormat_Invalid) {
+            supported.push_back(biPlanar); // Priority #1: Zero-CPU Native NV12 / P010!
+        }
+        supported.push_back(PrPixelFormat_BGRA_4444_8u); // Priority #2: GPU-converted BGRA8 (scaled/AE)
+        if (meta.bitDepth > 8) {
+            supported.push_back(PrPixelFormat_BGRA_4444_32f); // Priority #3: GPU RGBA16 -> BGRA32f (AE 32bpc)
+        }
+    } else {
+        supported.push_back(PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_10u_as16u_709);
+        supported.push_back(PrPixelFormat_YUV_420_MPEG4_FRAME_PICTURE_BIPLANAR_8u_709);
+        supported.push_back(PrPixelFormat_BGRA_4444_8u);
+        supported.push_back(PrPixelFormat_BGRA_4444_32f);
     }
-    if (index == 1) {
-        rec->outPixelFormat = PrPixelFormat_BGRA_4444_32f;
-        return malNoError;
+
+    if (index >= supported.size()) {
+        return imBadFormatIndex;
     }
-    return imBadFormatIndex;
+    rec->outPixelFormat = supported[index];
+    return malNoError;
 }
 
 prMALError ensureInstanceAndSession(imStdParms* stdParms,
@@ -672,8 +788,8 @@ prMALError ensureInstanceAndSession(imStdParms* stdParms,
     (*h)->acquireSuites(stdParms);
 
     const std::wstring wpath = prUtf16ToWide(filepath);
-    if (!(*h)->session) {
-        auto sess = std::make_unique<aer::AERSession>();
+    if (!(*h)->session()) {
+        auto sess = std::make_shared<aer::AERSession>();
         if (!sess->open(wpath, highPriority)) {
             if (allocatedNow) {
                 (*h)->releaseSuites();
@@ -682,7 +798,10 @@ prMALError ensureInstanceAndSession(imStdParms* stdParms,
             }
             return imBadFile;
         }
-        (*h)->session = sess.release();
+        if ((*h)->sessionHolder) {
+            delete (*h)->sessionHolder;
+        }
+        (*h)->sessionHolder = new std::shared_ptr<aer::AERSession>(std::move(sess));
     }
 
     ioPrivateData = reinterpret_cast<void*>(h);
@@ -733,8 +852,8 @@ prMALError handleQuietFile(imFileRef* fileRef, void* privateData) {
         *fileRef = imInvalidHandleValue;
     }
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(privateData);
-    if (h && *h && (*h)->session) {
-        (*h)->session->quiet();
+    if (h && *h && (*h)->session()) {
+        (*h)->session()->quiet();
     }
     return malNoError;
 }
@@ -743,10 +862,12 @@ prMALError handleCloseFile(imStdParms* stdParms, imFileRef* fileRef, void* priva
     handleQuietFile(fileRef, privateData);
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(privateData);
     if (h && *h) {
-        if ((*h)->session) {
-            (*h)->session->close();
-            delete (*h)->session;
-            (*h)->session = nullptr;
+        if ((*h)->sessionHolder) {
+            if (*((*h)->sessionHolder)) {
+                (*((*h)->sessionHolder))->close();
+            }
+            delete (*h)->sessionHolder;
+            (*h)->sessionHolder = nullptr;
         }
         (*h)->releaseSuites();
         if (stdParms && stdParms->piSuites && stdParms->piSuites->memFuncs) {
@@ -765,12 +886,12 @@ prMALError handleGetInfo8(imStdParms* stdParms,
     AERInstanceHandle h = nullptr;
     const prMALError err = ensureInstanceAndSession(
         stdParms, accessRec->filepath, infoRec->privatedata, highPriority, h);
-    if (err != malNoError || !h || !*h || !(*h)->session) {
+    if (err != malNoError || !h || !*h || !(*h)->session()) {
         return imBadFile;
     }
 
     stdParms->piSuites->memFuncs->lockHandle(reinterpret_cast<char**>(h));
-    const auto& meta = (*h)->session->metadata();
+    const auto& meta = (*h)->session()->metadata();
     if (infoRec->vidInfo.importerID != 0) {
         (*h)->importerID = infoRec->vidInfo.importerID;
     }
@@ -792,7 +913,6 @@ prMALError handleGetInfo8(imStdParms* stdParms,
         infoRec->vidInfo.alphaType = meta.hasAlpha ? alphaStraight : alphaNone;
         infoRec->vidInfo.pixelAspectNum = meta.parNum;
         infoRec->vidInfo.pixelAspectDen = meta.parDen;
-        // Enable Premiere Pro Async I/O (`imCreateAsyncImporter`) for Resolve-speed non-blocking scrubbing!
         infoRec->vidInfo.supportsAsyncIO = (meta.totalFrames > 1) ? kPrTrue : kPrFalse;
         infoRec->vidInfo.supportsGetSourceVideo = kPrTrue;
         infoRec->vidInfo.hasPulldown = kPrFalse;
@@ -816,7 +936,7 @@ prMALError handleGetInfo8(imStdParms* stdParms,
 
         if ((*h)->stringSuite) {
             const std::string desc = "ARZ: " + meta.videoCodecName + " (" +
-                                     (*h)->session->activeVideoBackend() + ")";
+                                     (*h)->session()->activeVideoBackend() + ")";
             (*h)->stringSuite->AllocateFromUTF8(
                 reinterpret_cast<const prUTF8Char*>(desc.c_str()),
                 &infoRec->vidInfo.codecDescription);
@@ -849,19 +969,19 @@ prMALError handleGetInfo8(imStdParms* stdParms,
 prMALError handlePreferredFrameSize(imPreferredFrameSizeRec* rec) {
     if (!rec) return imOtherErr;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(rec->inPrivateData);
-    if (!h || !*h || !(*h)->session || rec->inIndex != 0) {
+    if (!h || !*h || !(*h)->session() || rec->inIndex != 0) {
         return imOtherErr;
     }
-    rec->outWidth = (*h)->session->metadata().width;
-    rec->outHeight = (*h)->session->metadata().height;
+    rec->outWidth = (*h)->session()->metadata().width;
+    rec->outHeight = (*h)->session()->metadata().height;
     return malNoError;
 }
 
 prMALError handleGetTimeInfo8(imTimeInfoRec8* rec) {
     if (!rec) return malNoError;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(rec->privatedata);
-    if (h && *h && (*h)->session) {
-        const auto& tc = (*h)->session->metadata().timecodeString;
+    if (h && *h && (*h)->session()) {
+        const auto& tc = (*h)->session()->metadata().timecodeString;
         if (!tc.empty()) {
             strcpy_s(rec->orgtime, sizeof(rec->orgtime), tc.c_str());
             rec->dataType = 1;
@@ -873,19 +993,19 @@ prMALError handleGetTimeInfo8(imTimeInfoRec8* rec) {
 prMALError handleAnalysis(imAnalysisRec* rec) {
     if (!rec || !rec->buffer || rec->buffersize <= 0) return malNoError;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(rec->privatedata);
-    if (!h || !*h || !(*h)->session) return malNoError;
+    if (!h || !*h || !(*h)->session()) return malNoError;
 
-    const auto& m = (*h)->session->metadata();
+    const auto& m = (*h)->session()->metadata();
     char summary[512]{};
     std::snprintf(summary, sizeof(summary),
-                  "Importer: ARZ 1.0.0\r\nContainer: %s\r\nVideo: %s (%s, %d-bit%s, %s)\r\nDecoder: %s\r\nAudio: %s (%d Hz, %d ch)",
+                  "Importer: ARZ 1.2.0\r\nContainer: %s\r\nVideo: %s (%s, %d-bit%s, %s)\r\nDecoder: %s\r\nAudio: %s (%d Hz, %d ch)",
                   m.containerName.c_str(),
                   m.videoCodecName.c_str(),
                   m.videoProfileName.empty() ? "default" : m.videoProfileName.c_str(),
                   m.bitDepth,
                   m.hasAlpha ? " + Alpha" : "",
                   m.colorSpaceSummary.c_str(),
-                  (*h)->session->activeVideoBackend().c_str(),
+                  (*h)->session()->activeVideoBackend().c_str(),
                   m.hasAudio ? m.audioCodecName.c_str() : "none",
                   m.audioSampleRate,
                   m.audioChannels);
@@ -910,11 +1030,11 @@ prMALError handleCalcSize8(imCalcSizeRec* calcRec, imFileAccessRec8* accessRec) 
 prMALError handleGetSourceVideo(imSourceVideoRec* videoRec) {
     if (!videoRec || !videoRec->outFrame) return imOtherErr;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(videoRec->inPrivateData);
-    if (!h || !*h || !(*h)->session || !(*h)->ppixCreatorSuite || !(*h)->ppixSuite || !(*h)->timeSuite) {
+    if (!h || !*h || !(*h)->session() || !(*h)->ppixCreatorSuite || !(*h)->ppixSuite || !(*h)->timeSuite) {
         return imOtherErr;
     }
 
-    const auto& meta = (*h)->session->metadata();
+    const auto& meta = (*h)->session()->metadata();
     if (!meta.hasVideo) return imOtherErr;
 
     PrTime ticksPerSec = 0;
@@ -928,9 +1048,10 @@ prMALError handleGetSourceVideo(imSourceVideoRec* videoRec) {
     }
 
     return populatePPixFromSession(
-        (*h)->session,
+        (*h)->session(),
         (*h)->ppixCreatorSuite,
         (*h)->ppixSuite,
+        (*h)->ppix2Suite,
         (*h)->ppixCacheSuite,
         (*h)->importerID,
         frameNumber,
@@ -942,9 +1063,9 @@ prMALError handleGetSourceVideo(imSourceVideoRec* videoRec) {
 prMALError handleImportAudio7(imImportAudioRec7* audioRec) {
     if (!audioRec || !audioRec->buffer) return imOtherErr;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(audioRec->privateData);
-    if (!h || !*h || !(*h)->session) return imOtherErr;
+    if (!h || !*h || !(*h)->session()) return imOtherErr;
 
-    if (!(*h)->session->renderAudioSamples(
+    if (!(*h)->session()->renderAudioSamples(
             audioRec->position, static_cast<uint32_t>(audioRec->size), audioRec->buffer)) {
         return malUnknownError;
     }
@@ -956,9 +1077,9 @@ prMALError handleGetPeakAudio(imPeakAudioRec* peakRec) {
         return imOtherErr;
     }
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(peakRec->inPrivateData);
-    if (!h || !*h || !(*h)->session) return imOtherErr;
+    if (!h || !*h || !(*h)->session()) return imOtherErr;
 
-    if (!(*h)->session->renderAudioPeaks(
+    if (!(*h)->session()->renderAudioPeaks(
             peakRec->inPosition,
             peakRec->inSampleRate,
             peakRec->inNumSampleFrames,
@@ -972,9 +1093,9 @@ prMALError handleGetPeakAudio(imPeakAudioRec* peakRec) {
 prMALError handleGetAudioChannelLayout(imGetAudioChannelLayoutRec* layoutRec) {
     if (!layoutRec) return imOtherErr;
     AERInstanceHandle h = reinterpret_cast<AERInstanceHandle>(layoutRec->inPrivateData);
-    if (!h || !*h || !(*h)->session) return imOtherErr;
+    if (!h || !*h || !(*h)->session()) return imOtherErr;
 
-    const int ch = (*h)->session->metadata().audioChannels;
+    const int ch = (*h)->session()->metadata().audioChannels;
     for (int i = 0; i < kMaxAudioChannelCount; ++i) {
         layoutRec->outChannelLabels[i] = kPrAudioChannelLabel_Discrete;
     }

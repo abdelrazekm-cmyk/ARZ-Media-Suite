@@ -70,8 +70,6 @@ bool AERSession::open(const std::wstring& filePath, bool highPriorityMode) {
         avformat_close_input(&keptVideoCtx);
     }
 
-    // Lazy AudioDecoder initialization: for video+audio containers, defer opening a second
-    // AVFormatContext/codec until Premiere actually requests audio samples or waveform peaks!
     if (!meta_.hasVideo && meta_.hasAudio) {
         if (!ensureAudioDecoder()) {
             meta_.hasAudio = false;
@@ -82,7 +80,84 @@ bool AERSession::open(const std::wstring& filePath, bool highPriorityMode) {
         close();
         return false;
     }
+
+    if (meta_.hasVideo && meta_.totalFrames > 2 && AERConfig::instance().enableFrameCache) {
+        startLookaheadWorker();
+    }
     return true;
+}
+
+void AERSession::startLookaheadWorker() {
+    std::lock_guard<std::mutex> lock(lookaheadMutex_);
+    if (lookaheadRunning_) return;
+    lookaheadStop_ = false;
+    lookaheadTarget_.active = false;
+    lookaheadRunning_ = true;
+    lookaheadThread_ = std::thread(&AERSession::lookaheadLoop, this);
+}
+
+void AERSession::stopLookaheadWorker() {
+    {
+        std::lock_guard<std::mutex> lock(lookaheadMutex_);
+        if (!lookaheadRunning_) return;
+        lookaheadStop_ = true;
+        lookaheadTarget_.active = false;
+    }
+    lookaheadCv_.notify_all();
+    if (lookaheadThread_.joinable()) {
+        lookaheadThread_.join();
+    }
+    lookaheadRunning_ = false;
+}
+
+void AERSession::triggerLookahead(int64_t anchorFrame, int width, int height, PixelBufferFormat fmt, uint64_t generation) {
+    if (!lookaheadRunning_ || !AERConfig::instance().enableFrameCache) return;
+    {
+        std::lock_guard<std::mutex> lock(lookaheadMutex_);
+        lookaheadTarget_.anchorFrame = anchorFrame;
+        lookaheadTarget_.width = width;
+        lookaheadTarget_.height = height;
+        lookaheadTarget_.format = fmt;
+        lookaheadTarget_.generation = generation;
+        lookaheadTarget_.active = true;
+    }
+    lookaheadCv_.notify_one();
+}
+
+void AERSession::lookaheadLoop() {
+    constexpr int kMaxLookaheadWindow = 6;
+    while (true) {
+        LookaheadTarget target{};
+        {
+            std::unique_lock<std::mutex> lock(lookaheadMutex_);
+            lookaheadCv_.wait(lock, [this]() { return lookaheadStop_ || lookaheadTarget_.active; });
+            if (lookaheadStop_) break;
+            target = lookaheadTarget_;
+            lookaheadTarget_.active = false;
+        }
+
+        if (!videoDecoder_) continue;
+
+        for (int i = 0; i < kMaxLookaheadWindow; ++i) {
+            {
+                std::lock_guard<std::mutex> lock(lookaheadMutex_);
+                if (lookaheadStop_ || lookaheadTarget_.active) {
+                    break;
+                }
+            }
+            if (target.generation != 0 && target.generation != videoDecoder_->currentScrubGeneration()) {
+                break;
+            }
+            int64_t decodedNum = -1;
+            if (!videoDecoder_->decodeNextLookaheadFrame(
+                    target.width, target.height, target.format, target.generation, decodedNum)) {
+                break;
+            }
+            if (decodedNum < 0 || decodedNum >= target.anchorFrame + kMaxLookaheadWindow) {
+                break;
+            }
+        }
+    }
 }
 
 AudioDecoder* AERSession::ensureAudioDecoder() {
@@ -119,6 +194,7 @@ VideoDecoder* AERSession::ensureThumbnailDecoder() {
 }
 
 void AERSession::quiet() {
+    bumpScrubGeneration();
     if (videoDecoder_) {
         videoDecoder_->quietHardwareSession();
     }
@@ -144,6 +220,7 @@ void AERSession::quiet() {
 }
 
 void AERSession::close() {
+    stopLookaheadWorker();
     {
         std::lock_guard<std::mutex> lock(thumbInitMutex_);
         if (thumbDecoder_) {
@@ -228,6 +305,10 @@ size_t AERSession::totalCachedFrames() {
     return LRUFrameCache::instance().totalRamEntries();
 }
 
+void AERSession::clearAllCaches() {
+    LRUFrameCache::instance().clear();
+}
+
 bool AERSession::renderVideoFrame(int64_t frameNumber,
                                   int outWidth,
                                   int outHeight,
@@ -240,16 +321,19 @@ bool AERSession::renderVideoFrame(int64_t frameNumber,
     if (!videoDecoder_ || !meta_.hasVideo) {
         return false;
     }
-    // Isolate small thumbnail requests (<= 640px when source is larger) onto a separate decoder
-    // so Premiere's Timeline clip thumbnails NEVER lock or flush the active Timeline playhead decoder!
     if (outWidth <= 640 && outHeight <= 640 && (meta_.width > 640 || meta_.height > 640)) {
         if (VideoDecoder* td = ensureThumbnailDecoder()) {
             return td->decodeFrame(frameNumber, outWidth, outHeight, outRowBytes,
                                    outFormat, outPixels, flipVertical, false, 0);
         }
     }
-    return videoDecoder_->decodeFrame(frameNumber, outWidth, outHeight, outRowBytes,
-                                      outFormat, outPixels, flipVertical, fastKeyframeScrub, expectedGeneration);
+    const uint64_t genSnapshot = (expectedGeneration != 0) ? expectedGeneration : videoDecoder_->currentScrubGeneration();
+    const bool ok = videoDecoder_->decodeFrame(frameNumber, outWidth, outHeight, outRowBytes,
+                                               outFormat, outPixels, flipVertical, fastKeyframeScrub, expectedGeneration);
+    if (ok && outPixels != nullptr && !fastKeyframeScrub && outWidth >= (meta_.width / 2)) {
+        triggerLookahead(frameNumber, outWidth, outHeight, outFormat, genSnapshot);
+    }
+    return ok;
 }
 
 bool AERSession::renderAudioSamples(int64_t startSampleFrame,

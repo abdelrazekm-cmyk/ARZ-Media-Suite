@@ -64,19 +64,12 @@ void appendLogLine(const std::wstring& line) {
 }
 
 std::wstring detectDefaultInstallDir() {
-    std::error_code ec;
-    const wchar_t* pr27 = L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2027\\PlugIns\\Common";
-    if (std::filesystem::exists(pr27, ec)) {
-        return std::wstring(pr27) + L"\\ARZ";
-    }
-    const wchar_t* pr26 = L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2026\\PlugIns\\Common";
-    if (std::filesystem::exists(pr26, ec)) {
-        return std::wstring(pr26) + L"\\ARZ";
-    }
+    // Official shared MediaCore directory discovered automatically by
+    // Adobe Premiere Pro, Adobe Media Encoder, and Adobe After Effects!
     return L"C:\\Program Files\\Adobe\\Common\\Plug-ins\\7.0\\MediaCore\\ARZ";
 }
 
-bool isPremiereRunning() {
+bool isAdobeHostRunning() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
     PROCESSENTRY32W pe{};
@@ -86,7 +79,8 @@ bool isPremiereRunning() {
         do {
             std::wstring name(pe.szExeFile);
             if (name.find(L"Adobe Premiere Pro") != std::wstring::npos ||
-                name.find(L"Adobe Media Encoder") != std::wstring::npos) {
+                name.find(L"Adobe Media Encoder") != std::wstring::npos ||
+                name.find(L"AfterFX") != std::wstring::npos) {
                 running = true;
                 break;
             }
@@ -100,7 +94,8 @@ int clearAdobePluginCaches() {
     int clearedCount = 0;
     const wchar_t* roots[] = {
         L"Software\\Adobe\\Premiere Pro",
-        L"Software\\Adobe\\Adobe Media Encoder"
+        L"Software\\Adobe\\Adobe Media Encoder",
+        L"Software\\Adobe\\After Effects"
     };
     for (const wchar_t* r : roots) {
         HKEY hRoot = nullptr;
@@ -165,7 +160,7 @@ bool createDesktopShortcut(const std::wstring& targetExe) {
 }
 
 bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::wstring& outErr) {
-    appendLogLine(L"[1/5] Checking embedded standalone ARZ v1.1.0 payload...");
+    appendLogLine(L"[1/5] Checking embedded standalone ARZ v1.2.0 payload...");
     HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_PAYLOAD_ZIP), RT_RCDATA);
     if (!hRes) {
         outErr = L"[ERROR] Embedded payload resource (#201) is missing from Setup.exe.";
@@ -184,12 +179,23 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
 
     std::error_code ec;
     std::filesystem::path dst(targetDir);
-    std::filesystem::path legacyAer = dst.parent_path() / L"AER";
-    if (std::filesystem::exists(legacyAer, ec)) {
-        appendLogLine(L"[2/5] Removing legacy AER plugin folder: " + legacyAer.wstring());
-        std::filesystem::remove_all(legacyAer, ec);
-    } else {
-        appendLogLine(L"[2/5] Preparing clean target folder: " + dst.wstring());
+
+    // Clean ALL legacy per-app ARZ/AER folders so Premiere/AME/AE load ONLY the unified MediaCore\ARZ copy!
+    const wchar_t* legacyFolders[] = {
+        L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2027\\PlugIns\\Common\\ARZ",
+        L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2027\\PlugIns\\Common\\AER",
+        L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2026\\PlugIns\\Common\\ARZ",
+        L"C:\\Program Files\\Adobe\\Adobe Premiere Pro 2026\\PlugIns\\Common\\AER",
+        L"C:\\Program Files\\Adobe\\Adobe Media Encoder 2027\\PlugIns\\Common\\ARZ",
+        L"C:\\Program Files\\Adobe\\Common\\Plug-ins\\7.0\\MediaCore\\AER"
+    };
+    appendLogLine(L"[2/5] Cleaning legacy per-app folders & preparing shared MediaCore\\ARZ...");
+    for (const wchar_t* lf : legacyFolders) {
+        std::filesystem::path lp(lf);
+        if (lp != dst && std::filesystem::exists(lp, ec)) {
+            std::filesystem::remove_all(lp, ec);
+            appendLogLine(L"      -> Removed legacy folder: " + lp.wstring());
+        }
     }
 
     std::filesystem::create_directories(dst, ec);
@@ -234,14 +240,14 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
     for (const wchar_t* rf : requiredFiles) {
         if (exitCode != 0 || !std::filesystem::exists(dst / rf, ec)) {
             outErr = std::wstring(L"[ERROR] Failed extracting or verifying file: ") + rf +
-                     L" (make sure Premiere Pro & Media Encoder are completely closed).";
+                     L" (close Premiere Pro, Media Encoder & After Effects first).";
             appendLogLine(outErr);
             return false;
         }
     }
-    appendLogLine(L"      -> [OK] All ARZ plugins and standalone runtime DLLs verified on disk.");
+    appendLogLine(L"      -> [OK] Verified in shared MediaCore (Premiere + Media Encoder + After Effects).");
 
-    appendLogLine(L"[4/5] Resetting Adobe Premiere Pro & Media Encoder PluginCache...");
+    appendLogLine(L"[4/5] Resetting PluginCache for Premiere Pro, Media Encoder & After Effects...");
     const int cachesCleared = clearAdobePluginCaches();
     appendLogLine(L"      -> [OK] Cleared " + std::to_wstring(cachesCleared) + L" Adobe PluginCache registry trees.");
 
@@ -253,8 +259,8 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
     }
 
     appendLogLine(L"==================================================================");
-    appendLogLine(L"[SUCCESS] تم تثبيت حزمة ARZ Media Suite v1.1.0 بنجاح بدون أي أخطاء!");
-    appendLogLine(L"          يمكنك فتح Adobe Premiere Pro الآن مباشرة.");
+    appendLogLine(L"[SUCCESS] تم تثبيت ARZ Media Suite v1.2.0 في مسار MediaCore المشترك بنجاح!");
+    appendLogLine(L"          متاح الآن تلقائياً في Premiere Pro و Media Encoder و After Effects.");
     appendLogLine(L"==================================================================");
     g_installedDir = dst.wstring();
     return true;
@@ -267,13 +273,13 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
 
             HWND lblDir = CreateWindowExW(0, L"STATIC",
-                L"مسار تثبيت حزمة ARZ (Premiere Pro Target Folder):",
+                L"مسار التثبيت المشترك لبرامج أدوبي (Shared Adobe MediaCore Folder):",
                 WS_CHILD | WS_VISIBLE, 28, 128, 610, 22, hwnd, nullptr, nullptr, nullptr);
             g_editPath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", detectDefaultInstallDir().c_str(),
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 28, 154, 614, 28,
                 hwnd, reinterpret_cast<HMENU>(IDC_EDIT_PATH), nullptr, nullptr);
             g_btnInstall = CreateWindowExW(0, L"BUTTON",
-                L"تثبيت حزمة ARZ v1.1 الآن  (Install ARZ Suite)",
+                L"تثبيت حزمة ARZ v1.2 الآن  (Install ARZ Suite)",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 28, 194, 396, 42,
                 hwnd, reinterpret_cast<HMENU>(IDC_BTN_INSTALL), nullptr, nullptr);
             g_btnOpenCc = CreateWindowExW(0, L"BUTTON",
@@ -296,21 +302,21 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SendMessageW(lblLog, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
             SendMessageW(g_editLog, WM_SETFONT, reinterpret_cast<WPARAM>(g_monoFont), TRUE);
 
-            appendLogLine(L"[READY] حزمة ARZ Media Suite v1.1.0 مستقلة 100% وجاهزة للتثبيت.");
-            appendLogLine(L"[INFO]  لا تحتاج لأي إضافات خارجية (شاملة المستورد + مصدّر RTX السريع + FFmpeg 9.1+).");
+            appendLogLine(L"[READY] حزمة ARZ Media Suite v1.2.0 جاهزة للتثبيت في MediaCore المشترك.");
+            appendLogLine(L"[INFO]  تدعم Premiere Pro + Media Encoder + After Effects مع معالجة GPU NV12/P010.");
             return 0;
         }
 
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_BTN_INSTALL) {
                 SetWindowTextW(g_editLog, L"");
-                appendLogLine(L"[START] بدء عملية التثبيت وفحص البرامج المفتوحة...");
-                if (isPremiereRunning()) {
-                    appendLogLine(L"[ERROR] تم رصد تشغيل برنامج Adobe Premiere Pro أو Media Encoder حالياً!");
-                    appendLogLine(L"        برجاء إغلاقه تماماً ثم الضغط على تثبيت مرة أخرى.");
+                appendLogLine(L"[START] بدء عملية التثبيت وفحص برامج أدوبي المفتوحة...");
+                if (isAdobeHostRunning()) {
+                    appendLogLine(L"[ERROR] تم رصد تشغيل Premiere Pro أو Media Encoder أو After Effects حالياً!");
+                    appendLogLine(L"        برجاء إغلاق البرامج المفتوحة ثم الضغط على تثبيت مرة أخرى.");
                     MessageBoxW(hwnd,
-                        L"برجاء إغلاق برنامج Adobe Premiere Pro و Media Encoder أولاً قبل التثبيت.",
-                        L"ARZ Setup — Close Premiere Pro", MB_OK | MB_ICONWARNING);
+                        L"برجاء إغلاق Premiere Pro و Media Encoder و After Effects أولاً قبل التثبيت.",
+                        L"ARZ Setup — Close Adobe Apps", MB_OK | MB_ICONWARNING);
                     return 0;
                 }
                 wchar_t buf[MAX_PATH * 2]{};
@@ -375,12 +381,12 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, kColGold);
             HGDIOBJ oldFont = SelectObject(hdc, g_titleFont);
-            TextOutW(hdc, 252, 24, L"ARZ SUITE INSTALLER  v1.1", 25);
+            TextOutW(hdc, 252, 24, L"ARZ SUITE INSTALLER  v1.2", 25);
             SelectObject(hdc, oldFont);
 
             SetTextColor(hdc, kColCream);
             oldFont = SelectObject(hdc, g_uiFont);
-            TextOutW(hdc, 252, 60, L"Premiere Pro 27 Native Importer + Turbo RTX Exporter", 52);
+            TextOutW(hdc, 252, 60, L"Premiere Pro + Media Encoder + After Effects (GPU)", 50);
             SelectObject(hdc, oldFont);
 
             RECT goldLine{20, 114, rc.right - 20, 116};
@@ -445,7 +451,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"ARZ Media Suite v1.1.0 — Standalone Setup",
+        0, wc.lpszClassName, L"ARZ Media Suite v1.2.0 — Shared MediaCore Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 680, 505,
         nullptr, nullptr, hInst, nullptr);

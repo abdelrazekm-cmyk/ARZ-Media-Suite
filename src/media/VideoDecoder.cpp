@@ -55,6 +55,30 @@ void copyRows(uint8_t* dst,
     }
 }
 
+void copyBiPlanarRows(uint8_t* dstBase,
+                      int dstRowBytes,
+                      const uint8_t* srcBase,
+                      int srcRowBytes,
+                      int width,
+                      int height,
+                      int bytesPerSample) {
+    const int absDst = std::abs(dstRowBytes);
+    const int copyBytes = width * bytesPerSample;
+    for (int y = 0; y < height; ++y) {
+        std::memcpy(dstBase + static_cast<size_t>(y) * static_cast<size_t>(absDst),
+                    srcBase + static_cast<size_t>(y) * static_cast<size_t>(srcRowBytes),
+                    static_cast<size_t>(copyBytes));
+    }
+    uint8_t* dstUV = dstBase + static_cast<size_t>(absDst) * static_cast<size_t>(height);
+    const uint8_t* srcUV = srcBase + static_cast<size_t>(srcRowBytes) * static_cast<size_t>(height);
+    const int uvRows = height / 2;
+    for (int y = 0; y < uvRows; ++y) {
+        std::memcpy(dstUV + static_cast<size_t>(y) * static_cast<size_t>(absDst),
+                    srcUV + static_cast<size_t>(y) * static_cast<size_t>(srcRowBytes),
+                    static_cast<size_t>(copyBytes));
+    }
+}
+
 std::vector<AVHWDeviceType> buildPreferredHwBackendChain() {
     const std::string& pref = AERConfig::instance().preferredGpuBackend;
     if (pref == "d3d11va") return {AV_HWDEVICE_TYPE_D3D11VA};
@@ -165,6 +189,7 @@ void VideoDecoder::close() {
     usingSharedD3D11_ = false;
     quietedFromHardware_ = false;
     eofReached_ = false;
+    consecutiveHwErrors_ = 0;
     currentPts_ = AV_NOPTS_VALUE;
     currentFrameNumber_ = -1;
     if (!lowResourceThumbMode_) {
@@ -191,6 +216,7 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
     trackGpuActiveLocked(false);
     usingHardware_ = false;
     usingSharedD3D11_ = false;
+    consecutiveHwErrors_ = 0;
     hwPixFmt_ = AV_PIX_FMT_NONE;
 
     AVStream* st = fmtCtx_->streams[meta_.videoStreamIndex];
@@ -309,6 +335,7 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
         codecCtx_->opaque = &hwPixFmt_;
         codecCtx_->get_format = selectHwFormatCallback;
         codecCtx_->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
+        codecCtx_->extra_hw_frames = 8; // Extra surfaces for smooth NVDEC GOP lookahead!
         usingHardware_ = true;
         fallbackReason_ = "ok";
     } else if (lowResourceThumbMode_) {
@@ -453,8 +480,12 @@ bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta,
     publishTelemetryLocked();
 
     if (!lowResourceThumbMode_) {
+        const PixelBufferFormat defaultFmt =
+            (usingHardware_ && !meta_.hasAlpha && (meta_.width % 2 == 0) && (meta_.height % 2 == 0))
+                ? (meta_.bitDepth > 8 ? PixelBufferFormat::P010_10u : PixelBufferFormat::NV12_8u)
+                : PixelBufferFormat::BGRA_8u;
         materializeAndCacheFrameLocked(probed, 0, meta_.width, meta_.height,
-                                       meta_.width * 4, PixelBufferFormat::BGRA_8u, nullptr, false);
+                                       0, defaultFmt, nullptr, false);
     }
 
     av_frame_free(&probed);
@@ -465,12 +496,14 @@ bool VideoDecoder::decodeNextRawOrSwFrameLocked(AVFrame* outDecodedFrame, int64_
     av_frame_unref(outDecodedFrame);
     if (usingHardware_ && forceSimulateHwFailure_) {
         forceSimulateHwFailure_ = false;
+        consecutiveHwErrors_ = 10;
         return false;
     }
 
     while (true) {
         int ret = avcodec_receive_frame(codecCtx_, rawFrame_);
         if (ret == 0) {
+            consecutiveHwErrors_ = 0;
             const bool isKey = (rawFrame_->flags & AV_FRAME_FLAG_KEY) != 0;
             int64_t pts = rawFrame_->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) pts = rawFrame_->pts;
@@ -489,6 +522,7 @@ bool VideoDecoder::decodeNextRawOrSwFrameLocked(AVFrame* outDecodedFrame, int64_
             return false;
         }
         if (ret != AVERROR(EAGAIN)) {
+            ++consecutiveHwErrors_;
             return false;
         }
 
@@ -508,6 +542,7 @@ bool VideoDecoder::decodeNextRawOrSwFrameLocked(AVFrame* outDecodedFrame, int64_
             const int sendRet = avcodec_send_packet(codecCtx_, pkt_);
             av_packet_unref(pkt_);
             if (sendRet < 0 && sendRet != AVERROR(EAGAIN)) {
+                ++consecutiveHwErrors_;
                 return false;
             }
         } else {
@@ -527,28 +562,70 @@ bool VideoDecoder::materializeAndCacheFrameLocked(const AVFrame* decodedFrame,
     if (!decodedFrame) return false;
     const FrameCacheKey cacheKey{sessionId_, frameNumber, outWidth, outHeight, outFormat};
 
-    // FAST PATH 1: 100% GPU Hardware Color Conversion (NV12 / 10-bit P010 -> VRAM BGRA8 Texture)
-    if (!meta_.hasAlpha && usingHardware_ && usingSharedD3D11_ && decodedFrame->format == AV_PIX_FMT_D3D11 &&
-        outFormat == PixelBufferFormat::BGRA_8u && AERConfig::instance().enableGpuColorConvert) {
-        auto vramTex = GpuDeviceManager::instance().convertHwFrameToVramBgra8(
-            decodedFrame, outWidth, outHeight);
-        if (vramTex) {
+    // =========================================================================================
+    // ULTRA-FAST PATH 0: Native Hardware Bi-Planar NV12 / P010 (ZERO color conversion, ZERO CPU!)
+    // Premiere Pro 27 Mercury GPU Engine consumes NV12/P010 directly into CUDA/DirectX shaders!
+    // =========================================================================================
+    if ((outFormat == PixelBufferFormat::NV12_8u || outFormat == PixelBufferFormat::P010_10u) &&
+        usingHardware_ && usingSharedD3D11_ && decodedFrame->format == AV_PIX_FMT_D3D11 &&
+        outWidth == meta_.width && outHeight == meta_.height) {
+        DXGI_FORMAT dxgiFmt = DXGI_FORMAT_UNKNOWN;
+        int allocW = 0, allocH = 0;
+        auto yuvVramTex = GpuDeviceManager::instance().copyHwFrameToVramYuv(
+            decodedFrame, dxgiFmt, allocW, allocH);
+        const DXGI_FORMAT wantedDxgi = (outFormat == PixelBufferFormat::P010_10u) ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+        if (yuvVramTex && dxgiFmt == wantedDxgi) {
             bool ok = true;
-            if (optionalCpuDst) {
-                ok = GpuDeviceManager::instance().readbackVramTextureToCpu(
-                    vramTex.Get(), outWidth, outHeight, optionalCpuDst, outRowBytes, flipVertical);
-                if (ok && !flipVertical && outWidth <= 640 && outHeight <= 640 && outRowBytes == outWidth * 4) {
-                    ThumbnailCache::storeBGRA8(
-                        filePath_, outWidth, outHeight, frameNumber,
-                        optionalCpuDst, static_cast<size_t>(outRowBytes) * static_cast<size_t>(outHeight));
-                }
+            if (optionalCpuDst && outRowBytes != 0) {
+                ok = GpuDeviceManager::instance().readbackVramYuvToCpu(
+                    yuvVramTex.Get(), dxgiFmt, outWidth, outHeight, allocW, allocH, optionalCpuDst, outRowBytes);
             }
-            LRUFrameCache::instance().putVramTexture(cacheKey, std::move(vramTex));
+            LRUFrameCache::instance().putVramTexture(cacheKey, std::move(yuvVramTex), dxgiFmt, allocW, allocH);
             return ok;
         }
     }
 
-    // PATH 2: Software / Alpha / 32-bit float conversion -> RAM cache (always stored top-down in cache)
+    // =========================================================================================
+    // FAST PATH 1: 100% GPU Hardware Color Conversion & Scaling (BGRA_8u AND 10-bit BGRA_32f!)
+    // Eliminates CPU sws_scale even when Premiere or After Effects requests 32-bit float!
+    // =========================================================================================
+    if (!meta_.hasAlpha && usingHardware_ && usingSharedD3D11_ && decodedFrame->format == AV_PIX_FMT_D3D11 &&
+        (outFormat == PixelBufferFormat::BGRA_8u || outFormat == PixelBufferFormat::BGRA_32f) &&
+        AERConfig::instance().enableGpuColorConvert) {
+        DXGI_FORMAT vpFmt = (outFormat == PixelBufferFormat::BGRA_32f)
+                                ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                : DXGI_FORMAT_B8G8R8A8_UNORM;
+        auto vramTex = GpuDeviceManager::instance().convertHwFrameToVramBgra8(
+            decodedFrame, outWidth, outHeight, vpFmt);
+        if (!vramTex && vpFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            vpFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+            vramTex = GpuDeviceManager::instance().convertHwFrameToVramBgra8(
+                decodedFrame, outWidth, outHeight, vpFmt);
+        }
+        if (vramTex) {
+            bool ok = true;
+            if (optionalCpuDst && outRowBytes != 0) {
+                if (outFormat == PixelBufferFormat::BGRA_32f) {
+                    ok = GpuDeviceManager::instance().readbackVramR10G10B10A2ToBgra32fCpu(
+                        vramTex.Get(), vpFmt, outWidth, outHeight, optionalCpuDst, outRowBytes, flipVertical);
+                } else {
+                    ok = GpuDeviceManager::instance().readbackVramTextureToCpu(
+                        vramTex.Get(), outWidth, outHeight, optionalCpuDst, outRowBytes, flipVertical);
+                    if (ok && !flipVertical && outWidth <= 640 && outHeight <= 640 && outRowBytes == outWidth * 4) {
+                        ThumbnailCache::storeBGRA8(
+                            filePath_, outWidth, outHeight, frameNumber,
+                            optionalCpuDst, static_cast<size_t>(outRowBytes) * static_cast<size_t>(outHeight));
+                    }
+                }
+            }
+            LRUFrameCache::instance().putVramTexture(cacheKey, std::move(vramTex), vpFmt, outWidth, outHeight);
+            return ok;
+        }
+    }
+
+    // =========================================================================================
+    // PATH 2: Software / Alpha / Non-D3D11 fallback
+    // =========================================================================================
     const AVFrame* swSrc = decodedFrame;
     if (usingHardware_ && decodedFrame->format == hwPixFmt_) {
         av_frame_unref(swTransferFrame_);
@@ -560,8 +637,30 @@ bool VideoDecoder::materializeAndCacheFrameLocked(const AVFrame* decodedFrame,
         swSrc = swTransferFrame_;
     }
 
+    if (outFormat == PixelBufferFormat::NV12_8u || outFormat == PixelBufferFormat::P010_10u) {
+        const int bps = (outFormat == PixelBufferFormat::P010_10u) ? 2 : 1;
+        const int tightStride = outWidth * bps;
+        auto ramCached = std::make_shared<CachedVideoFrame>();
+        ramCached->frameNumber = frameNumber;
+        ramCached->width = outWidth;
+        ramCached->height = outHeight;
+        ramCached->rowBytes = tightStride;
+        ramCached->format = outFormat;
+        ramCached->pixels.resize(estimateTightFrameBytes(outWidth, outHeight, outFormat));
+        if (!convertSwAVFrameToTargetLocked(swSrc, outWidth, outHeight, tightStride,
+                                            outFormat, ramCached->pixels.data())) {
+            return false;
+        }
+        if (optionalCpuDst && outRowBytes != 0) {
+            copyBiPlanarRows(optionalCpuDst, outRowBytes, ramCached->pixels.data(),
+                             tightStride, outWidth, outHeight, bps);
+        }
+        LRUFrameCache::instance().putRamFrame(cacheKey, std::move(ramCached));
+        return true;
+    }
+
     const int tightRowBytes = outWidth * (outFormat == PixelBufferFormat::BGRA_32f ? 16 : 4);
-    if (lowResourceThumbMode_ && optionalCpuDst) {
+    if (lowResourceThumbMode_ && optionalCpuDst && outRowBytes != 0) {
         std::vector<uint8_t> tmpThumb(static_cast<size_t>(tightRowBytes) * static_cast<size_t>(outHeight));
         if (!convertSwAVFrameToTargetLocked(swSrc, outWidth, outHeight, tightRowBytes,
                                             outFormat, tmpThumb.data())) {
@@ -589,7 +688,7 @@ bool VideoDecoder::materializeAndCacheFrameLocked(const AVFrame* decodedFrame,
         return false;
     }
 
-    if (optionalCpuDst) {
+    if (optionalCpuDst && outRowBytes != 0) {
         copyRows(optionalCpuDst, outRowBytes, ramCached->pixels.data(),
                  tightRowBytes, tightRowBytes, outHeight, flipVertical);
     }
@@ -612,8 +711,10 @@ bool VideoDecoder::convertSwAVFrameToTargetLocked(const AVFrame* src,
         return false;
     }
 
-    const AVPixelFormat targetAvFmt =
-        (outFormat == PixelBufferFormat::BGRA_32f) ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_BGRA;
+    AVPixelFormat targetAvFmt = AV_PIX_FMT_BGRA;
+    if (outFormat == PixelBufferFormat::BGRA_32f) targetAvFmt = AV_PIX_FMT_RGBA64LE;
+    else if (outFormat == PixelBufferFormat::NV12_8u) targetAvFmt = AV_PIX_FMT_NV12;
+    else if (outFormat == PixelBufferFormat::P010_10u) targetAvFmt = AV_PIX_FMT_P010LE;
 
     if (!swsCtx_ || swsSrcW_ != src->width || swsSrcH_ != src->height || swsSrcFmt_ != src->format ||
         swsDstW_ != outWidth || swsDstH_ != outHeight || swsDstFmt_ != static_cast<int>(targetAvFmt)) {
@@ -628,7 +729,7 @@ bool VideoDecoder::convertSwAVFrameToTargetLocked(const AVFrame* src,
         av_opt_set_int(swsCtx_, "dsth", outHeight, 0);
         av_opt_set_int(swsCtx_, "dst_format", targetAvFmt, 0);
         av_opt_set_int(swsCtx_, "sws_flags", SWS_BILINEAR, 0);
-        if (AERConfig::instance().enableMultithreading) {
+        if (AERConfig::instance().enableMultithreading && !lowResourceThumbMode_) {
             av_opt_set_int(swsCtx_, "threads", std::clamp(av_cpu_count() / 2, 1, 8), 0);
         }
         if (sws_init_context(swsCtx_, nullptr, nullptr) < 0) {
@@ -652,6 +753,17 @@ bool VideoDecoder::convertSwAVFrameToTargetLocked(const AVFrame* src,
         swsDstW_ = outWidth;
         swsDstH_ = outHeight;
         swsDstFmt_ = static_cast<int>(targetAvFmt);
+    }
+
+    if (outFormat == PixelBufferFormat::NV12_8u || outFormat == PixelBufferFormat::P010_10u) {
+        uint8_t* dstPlanes[4] = {
+            dstBuffer,
+            dstBuffer + static_cast<size_t>(outRowBytes) * static_cast<size_t>(outHeight),
+            nullptr,
+            nullptr
+        };
+        int dstStrides[4] = {outRowBytes, outRowBytes, 0, 0};
+        return sws_scale(swsCtx_, src->data, src->linesize, 0, src->height, dstPlanes, dstStrides) > 0;
     }
 
     if (outFormat == PixelBufferFormat::BGRA_8u) {
@@ -695,7 +807,7 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
                                bool flipVertical,
                                bool fastKeyframeScrub,
                                uint64_t expectedGeneration) {
-    if (!outBuffer || outWidth <= 0 || outHeight <= 0 || outRowBytes == 0) {
+    if (outWidth <= 0 || outHeight <= 0 || (outBuffer != nullptr && outRowBytes == 0)) {
         return false;
     }
 
@@ -708,7 +820,7 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
         return true;
     }
 
-    if (outFormat == PixelBufferFormat::BGRA_8u && outWidth <= 640 && outHeight <= 640) {
+    if (outBuffer && outFormat == PixelBufferFormat::BGRA_8u && outWidth <= 640 && outHeight <= 640) {
         std::vector<uint8_t> thumbPixels;
         if (ThumbnailCache::tryLoadBGRA8(filePath_, outWidth, outHeight, clampedFrame, thumbPixels)) {
             copyRows(outBuffer, outRowBytes, thumbPixels.data(), tightRowBytes, tightRowBytes, outHeight, flipVertical);
@@ -717,7 +829,7 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
     }
 
     if (expectedGeneration != 0 && expectedGeneration != currentScrubGeneration()) {
-        return false; // Already superseded by a newer mouse scrub frame!
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -742,13 +854,12 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
         }
     }
 
-    // Detect rapid mouse-drag timeline scrubbing (> 3 non-sequential jumps within 180 ms)
     const auto now = std::chrono::steady_clock::now();
     const bool isSequentialOrReverseStep =
         (lastRequestedFrame_ >= 0 && std::abs(clampedFrame - lastRequestedFrame_) <= 8);
     if (!isSequentialOrReverseStep) {
         const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastJumpTime_).count();
-        if (elapsedMs >= 0 && elapsedMs < 140) {
+        if (elapsedMs >= 0 && elapsedMs < 150) {
             ++rapidJumpStreak_;
         } else {
             rapidJumpStreak_ = 0;
@@ -758,12 +869,12 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
         rapidJumpStreak_ = 0;
     }
     const bool isReverseStep = (lastRequestedFrame_ >= 0 && clampedFrame < lastRequestedFrame_ &&
-                                (lastRequestedFrame_ - clampedFrame) <= 24);
+                                (lastRequestedFrame_ - clampedFrame) <= 16);
     lastRequestedFrame_ = clampedFrame;
 
-    // DaVinci Resolve-style Fast Scrub: when dragging rapidly across Long-GOP clips,
-    // snap intermediate drag previews to the nearest keyframe (~4 ms!) so the viewer never lags!
-    const bool useFastKeyPreview = fastKeyframeScrub || (rapidJumpStreak_ >= 3);
+    // Snap to keyframe ONLY when explicitly requested (`fastKeyframeScrub == true`);
+    // Premiere's `aiSelectEfficientRenderTime` handles rapid scrub snapping without corrupting exact playback frames!
+    const bool useFastKeyPreview = fastKeyframeScrub;
 
     AVStream* st = fmtCtx_->streams[meta_.videoStreamIndex];
     const int64_t targetPts = seekIndex_.frameToTargetPts(clampedFrame);
@@ -772,15 +883,17 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
     AVFrame* decoded = av_frame_alloc();
     AVFrame* lastValid = av_frame_alloc();
     int64_t deliveredFrameNum = clampedFrame;
-
     bool haveLastValid = false;
-    for (int attempt = 0; attempt < 2 && !haveLastValid; ++attempt) {
+    bool cancelledByScrub = false;
+
+    for (int attempt = 0; attempt < 2 && !haveLastValid && !cancelledByScrub; ++attempt) {
+        const int64_t forwardWindow = usingHardware_ ? 64 : 24;
         const bool canStepForward =
             (attempt == 0) && !useFastKeyPreview &&
             ((currentFrameNumber_ >= 0 &&
               clampedFrame > currentFrameNumber_ &&
-              (clampedFrame - currentFrameNumber_) <= 24) ||
-             seekIndex_.shouldDecodeForward(currentPts_, targetPts, 24));
+              (clampedFrame - currentFrameNumber_) <= forwardWindow) ||
+             seekIndex_.shouldDecodeForward(currentPts_, targetPts, forwardWindow));
 
         if (!canStepForward) {
             int64_t seekPts = targetPts;
@@ -803,7 +916,8 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
         constexpr int kMaxGOPDecodeFrames = 450;
         while (decodedInBurst < kMaxGOPDecodeFrames) {
             if (expectedGeneration != 0 && expectedGeneration != currentScrubGeneration()) {
-                break; // Immediately abort stale Long-GOP decode when playhead moved!
+                cancelledByScrub = true; // Scrub cancelled — NEVER treat this as a GPU hardware failure!
+                break;
             }
 
             int64_t pts = AV_NOPTS_VALUE;
@@ -840,16 +954,14 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
             haveLastValid = true;
 
             if (useFastKeyPreview) {
-                // Deliver this keyframe immediately (~4 ms) during high-speed mouse drag!
                 deliveredFrameNum = estFrame;
                 break;
             }
 
-            // Pre-cache trailing frames ONLY during active reverse-scrubbing (never stall forward jumps!)
             if (isReverseStep && (clampedFrame - estFrame) > 0 && (clampedFrame - estFrame) <= 8 &&
                 AERConfig::instance().enableFrameCache && outWidth >= (meta_.width / 2)) {
                 materializeAndCacheFrameLocked(
-                    decoded, estFrame, outWidth, outHeight, tightRowBytes, outFormat, nullptr, false);
+                    decoded, estFrame, outWidth, outHeight, 0, outFormat, nullptr, false);
             }
 
             if ((pts != AV_NOPTS_VALUE && pts + halfStep >= targetPts) || estFrame >= clampedFrame) {
@@ -858,7 +970,12 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
             }
         }
 
-        if (!haveLastValid && usingHardware_ && attempt == 0) {
+        if (cancelledByScrub) {
+            break;
+        }
+
+        // Only fallback to software if genuine repeated hardware decode errors occurred!
+        if (!haveLastValid && usingHardware_ && attempt == 0 && consecutiveHwErrors_ >= 4) {
             if (!fallbackToSoftwareMidStreamLocked("mid_playback_gpu_decode_failure")) {
                 break;
             }
@@ -868,7 +985,7 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
     }
 
     bool ok = false;
-    if (haveLastValid) {
+    if (haveLastValid && !cancelledByScrub) {
         ok = materializeAndCacheFrameLocked(
             lastValid, deliveredFrameNum, outWidth, outHeight, outRowBytes, outFormat, outBuffer, flipVertical);
         publishTelemetryLocked();
@@ -876,6 +993,60 @@ bool VideoDecoder::decodeFrame(int64_t frameNumber,
 
     av_frame_free(&decoded);
     av_frame_free(&lastValid);
+    return ok;
+}
+
+bool VideoDecoder::decodeNextLookaheadFrame(int outWidth,
+                                            int outHeight,
+                                            PixelBufferFormat outFormat,
+                                            uint64_t expectedGeneration,
+                                            int64_t& outDecodedFrameNum) {
+    outDecodedFrameNum = -1;
+    if (lowResourceThumbMode_ || outWidth <= 0 || outHeight <= 0) {
+        return false;
+    }
+    if (expectedGeneration != 0 && expectedGeneration != currentScrubGeneration()) {
+        return false;
+    }
+
+    // Never block an interactive UI scrub/render call — yield immediately if mutex_ is busy!
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || !fmtCtx_ || !codecCtx_ || eofReached_ || currentFrameNumber_ < 0) {
+        return false;
+    }
+    if (expectedGeneration != 0 && expectedGeneration != currentScrubGeneration()) {
+        return false;
+    }
+
+    const int64_t nextExpected = currentFrameNumber_ + 1;
+    if (nextExpected >= meta_.totalFrames) {
+        return false;
+    }
+    const FrameCacheKey checkKey{sessionId_, nextExpected, outWidth, outHeight, outFormat};
+    if (LRUFrameCache::instance().hasCachedFrame(checkKey)) {
+        outDecodedFrameNum = nextExpected;
+        return true;
+    }
+
+    AVFrame* nextDecoded = av_frame_alloc();
+    if (!nextDecoded) return false;
+
+    int64_t pts = AV_NOPTS_VALUE;
+    bool isKey = false;
+    bool ok = false;
+    if (decodeNextRawOrSwFrameLocked(nextDecoded, pts, isKey)) {
+        int64_t estFrame = nextExpected;
+        if (pts != AV_NOPTS_VALUE) {
+            estFrame = seekIndex_.ptsToApproxFrame(pts);
+        }
+        currentPts_ = pts;
+        currentFrameNumber_ = estFrame;
+        seekIndex_.recordObservedFrame(estFrame, pts, isKey);
+        ok = materializeAndCacheFrameLocked(
+            nextDecoded, estFrame, outWidth, outHeight, 0, outFormat, nullptr, false);
+        outDecodedFrameNum = estFrame;
+    }
+    av_frame_free(&nextDecoded);
     return ok;
 }
 

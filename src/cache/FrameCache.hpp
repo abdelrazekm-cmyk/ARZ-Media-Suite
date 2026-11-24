@@ -16,9 +16,22 @@
 namespace aer {
 
 enum class PixelBufferFormat : uint8_t {
-    BGRA_8u = 0,
-    BGRA_32f = 1
+    BGRA_8u  = 0,
+    BGRA_32f = 1,
+    NV12_8u  = 2,
+    P010_10u = 3
 };
+
+inline size_t estimateTightFrameBytes(int width, int height, PixelBufferFormat fmt) noexcept {
+    const size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+    switch (fmt) {
+        case PixelBufferFormat::BGRA_32f: return pixels * 16ULL;
+        case PixelBufferFormat::NV12_8u:  return (pixels * 3ULL) / 2ULL;
+        case PixelBufferFormat::P010_10u: return pixels * 3ULL;
+        case PixelBufferFormat::BGRA_8u:
+        default:                          return pixels * 4ULL;
+    }
+}
 
 struct CachedVideoFrame {
     int64_t frameNumber = 0;
@@ -33,6 +46,9 @@ struct CachedVramFrame {
     int64_t frameNumber = 0;
     int width = 0;
     int height = 0;
+    int texAllocWidth = 0;
+    int texAllocHeight = 0;
+    DXGI_FORMAT dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     size_t byteEstimate = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
 };
@@ -68,7 +84,11 @@ public:
                             int dstRowBytes,
                             bool flipVertical = false);
 
-    void putVramTexture(const FrameCacheKey& key, Microsoft::WRL::ComPtr<ID3D11Texture2D> tex);
+    void putVramTexture(const FrameCacheKey& key,
+                        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex,
+                        DXGI_FORMAT dxgiFormat = DXGI_FORMAT_B8G8R8A8_UNORM,
+                        int texAllocW = 0,
+                        int texAllocH = 0);
     void putRamFrame(const FrameCacheKey& key, std::shared_ptr<CachedVideoFrame> frame);
 
     void evictSession(uint64_t sessionId);

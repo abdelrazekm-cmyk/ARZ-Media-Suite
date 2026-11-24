@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -59,6 +60,7 @@ private:
     int32_t tbNum_ = 1;
     int32_t tbDen_ = 1000;
     int lastImportedIndexCount_ = 0;
+    std::atomic<bool> cuesHarvested_{false};
     std::vector<KeyframeAnchor> keyframes_;
     std::map<int64_t, int64_t> observedFramePts_;
 };

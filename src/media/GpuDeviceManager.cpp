@@ -1,6 +1,8 @@
 #include "media/GpuDeviceManager.hpp"
 #include "media/DemuxEngine.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 
 extern "C" {
@@ -21,6 +23,7 @@ GpuDeviceManager::~GpuDeviceManager() {
         p.tex.Detach();
     }
     vramTexPool_.clear();
+    bestAdapter_.Detach();
     adapter3_.Detach();
     vpEnum_.Detach();
     videoProcessor_.Detach();
@@ -44,7 +47,6 @@ bool GpuDeviceManager::ensureInitialized() {
         return false;
     }
 
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> bestAdapter;
     DXGI_ADAPTER_DESC1 bestDesc{};
     uint64_t bestScore = 0;
 
@@ -64,16 +66,17 @@ bool GpuDeviceManager::ensureInitialized() {
         }
         if (score > bestScore) {
             bestScore = score;
-            bestAdapter = cand;
+            bestAdapter_ = cand;
+            bestAdapterIndex_ = idx;
             bestDesc = desc;
         }
     }
 
-    if (!bestAdapter) {
+    if (!bestAdapter_) {
         return false;
     }
 
-    bestAdapter.As(&adapter3_);
+    bestAdapter_.As(&adapter3_);
     vendorId_ = bestDesc.VendorId;
     adapterName_ = DemuxEngine::wideToUtf8(std::wstring(bestDesc.Description));
 
@@ -85,7 +88,7 @@ bool GpuDeviceManager::ensureInitialized() {
     const UINT createFlags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
     if (FAILED(D3D11CreateDevice(
-            bestAdapter.Get(),
+            bestAdapter_.Get(),
             D3D_DRIVER_TYPE_UNKNOWN,
             nullptr,
             createFlags,
@@ -139,6 +142,19 @@ AVBufferRef* GpuDeviceManager::acquireSharedD3D11HwDeviceRef() {
     return ffHwDeviceRef_ ? av_buffer_ref(ffHwDeviceRef_) : nullptr;
 }
 
+AVBufferRef* GpuDeviceManager::createIsolatedD3D11HwDeviceRef() {
+    if (!ensureInitialized()) {
+        return nullptr;
+    }
+    AVBufferRef* isolatedRef = nullptr;
+    const std::string adapterIdxStr = std::to_string(bestAdapterIndex_);
+    if (av_hwdevice_ctx_create(&isolatedRef, AV_HWDEVICE_TYPE_D3D11VA, adapterIdxStr.c_str(), nullptr, 0) == 0 &&
+        isolatedRef) {
+        return isolatedRef;
+    }
+    return acquireSharedD3D11HwDeviceRef();
+}
+
 VramStatus GpuDeviceManager::queryVramStatus(uint64_t aerCachedVramBytes) const {
     VramStatus st{};
     st.aerCachedVramBytes = aerCachedVramBytes;
@@ -154,10 +170,131 @@ VramStatus GpuDeviceManager::queryVramStatus(uint64_t aerCachedVramBytes) const 
     return st;
 }
 
+Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::copyHwFrameToVramYuv(
+    const AVFrame* hwFrame,
+    DXGI_FORMAT& outDxgiFormat,
+    int& outAllocWidth,
+    int& outAllocHeight) {
+    outDxgiFormat = DXGI_FORMAT_UNKNOWN;
+    outAllocWidth = 0;
+    outAllocHeight = 0;
+    if (!hwFrame || !hwFrame->data[0] || !ensureInitialized()) {
+        return nullptr;
+    }
+
+    auto* srcTex = reinterpret_cast<ID3D11Texture2D*>(hwFrame->data[0]);
+    const UINT srcSlice = static_cast<UINT>(reinterpret_cast<intptr_t>(hwFrame->data[1]));
+
+    D3D11_TEXTURE2D_DESC srcDesc{};
+    srcTex->GetDesc(&srcDesc);
+    if (srcDesc.Format != DXGI_FORMAT_NV12 && srcDesc.Format != DXGI_FORMAT_P010) {
+        return nullptr;
+    }
+
+    // Check that srcTex belongs to our shared D3D11 device
+    Microsoft::WRL::ComPtr<ID3D11Device> srcDev;
+    srcTex->GetDevice(srcDev.GetAddressOf());
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!device_ || !context_ || srcDev.Get() != device_.Get()) {
+        return nullptr;
+    }
+
+    const int allocW = static_cast<int>(srcDesc.Width);
+    const int allocH = static_cast<int>(srcDesc.Height);
+    // BindFlags = 0 for NV12/P010 VRAM cache surfaces guarantees CreateTexture2D succeeds on all D3D11 drivers!
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex =
+        acquireOutputTextureLocked(allocW, allocH, srcDesc.Format, 0);
+    if (!outTex) {
+        return nullptr;
+    }
+
+    auto* hwDevCtx = reinterpret_cast<AVHWDeviceContext*>(ffHwDeviceRef_->data);
+    auto* d3d11Ctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwDevCtx->hwctx);
+    if (d3d11Ctx->lock) d3d11Ctx->lock(d3d11Ctx->lock_ctx);
+    context_->CopySubresourceRegion(outTex.Get(), 0, 0, 0, 0, srcTex, srcSlice, nullptr);
+    if (d3d11Ctx->unlock) d3d11Ctx->unlock(d3d11Ctx->lock_ctx);
+
+    outDxgiFormat = srcDesc.Format;
+    outAllocWidth = allocW;
+    outAllocHeight = allocH;
+    return outTex;
+}
+
+bool GpuDeviceManager::readbackVramYuvToCpu(
+    ID3D11Texture2D* yuvTex,
+    DXGI_FORMAT fmt,
+    int visibleWidth,
+    int visibleHeight,
+    int texAllocWidth,
+    int texAllocHeight,
+    uint8_t* dstBase,
+    int dstRowBytes) {
+    if (!yuvTex || !dstBase || visibleWidth <= 0 || visibleHeight <= 0 || dstRowBytes == 0) {
+        return false;
+    }
+    if (fmt != DXGI_FORMAT_NV12 && fmt != DXGI_FORMAT_P010) {
+        return false;
+    }
+
+    const int allocW = texAllocWidth > 0 ? texAllocWidth : visibleWidth;
+    const int allocH = texAllocHeight > 0 ? texAllocHeight : visibleHeight;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!device_ || !context_ || !ensureStagingTextureLocked(allocW, allocH, fmt)) {
+        return false;
+    }
+
+    context_->CopyResource(stagingTex_.Get(), yuvTex);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+        return false;
+    }
+
+    const int bytesPerSample = (fmt == DXGI_FORMAT_P010) ? 2 : 1;
+    const size_t copyRowBytes = static_cast<size_t>(visibleWidth) * static_cast<size_t>(bytesPerSample);
+    const size_t absDstStride = static_cast<size_t>(std::abs(dstRowBytes));
+    const size_t srcStride = static_cast<size_t>(mapped.RowPitch);
+
+    const auto* srcY = static_cast<const uint8_t*>(mapped.pData);
+    const auto* srcUV = srcY + srcStride * static_cast<size_t>(allocH);
+
+    uint8_t* dstY = dstBase;
+    uint8_t* dstUV = dstBase + absDstStride * static_cast<size_t>(visibleHeight);
+
+    // Plane 0: Y (Top-Down)
+    if (absDstStride == srcStride && srcStride == copyRowBytes) {
+        std::memcpy(dstY, srcY, copyRowBytes * static_cast<size_t>(visibleHeight));
+    } else {
+        for (int y = 0; y < visibleHeight; ++y) {
+            std::memcpy(dstY + static_cast<size_t>(y) * absDstStride,
+                        srcY + static_cast<size_t>(y) * srcStride,
+                        copyRowBytes);
+        }
+    }
+
+    // Plane 1: Interleaved UV (Top-Down, visibleHeight / 2 rows)
+    const int uvRows = visibleHeight / 2;
+    if (absDstStride == srcStride && srcStride == copyRowBytes) {
+        std::memcpy(dstUV, srcUV, copyRowBytes * static_cast<size_t>(uvRows));
+    } else {
+        for (int y = 0; y < uvRows; ++y) {
+            std::memcpy(dstUV + static_cast<size_t>(y) * absDstStride,
+                        srcUV + static_cast<size_t>(y) * srcStride,
+                        copyRowBytes);
+        }
+    }
+
+    context_->Unmap(stagingTex_.Get(), 0);
+    return true;
+}
+
 Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::convertHwFrameToVramBgra8(
     const AVFrame* hwFrame,
     int dstWidth,
-    int dstHeight) {
+    int dstHeight,
+    DXGI_FORMAT targetDxgiFmt) {
     if (!hwFrame || !hwFrame->data[0] || dstWidth <= 0 || dstHeight <= 0) {
         return nullptr;
     }
@@ -168,15 +305,19 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::convertHwFrameToVramBg
     auto* srcTex = reinterpret_cast<ID3D11Texture2D*>(hwFrame->data[0]);
     const UINT srcSlice = static_cast<UINT>(reinterpret_cast<intptr_t>(hwFrame->data[1]));
 
+    Microsoft::WRL::ComPtr<ID3D11Device> srcDev;
+    srcTex->GetDevice(srcDev.GetAddressOf());
+
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!ffHwDeviceRef_ || !videoDevice_ || !videoContext_ || !device_) {
+    if (!ffHwDeviceRef_ || !videoDevice_ || !videoContext_ || !device_ || srcDev.Get() != device_.Get()) {
         return nullptr;
     }
 
     auto* hwDevCtx = reinterpret_cast<AVHWDeviceContext*>(ffHwDeviceRef_->data);
     auto* d3d11Ctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwDevCtx->hwctx);
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex = acquireOutputTextureLocked(dstWidth, dstHeight);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex = acquireOutputTextureLocked(
+        dstWidth, dstHeight, targetDxgiFmt, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
     if (!outTex) {
         return nullptr;
     }
@@ -264,8 +405,8 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::convertHwFrameToVramBg
     return outTex;
 }
 
-bool GpuDeviceManager::ensureStagingTextureLocked(int width, int height) {
-    if (stagingTex_ && stagingW_ == width && stagingH_ == height) {
+bool GpuDeviceManager::ensureStagingTextureLocked(int width, int height, DXGI_FORMAT fmt) {
+    if (stagingTex_ && stagingW_ == width && stagingH_ == height && stagingFmt_ == fmt) {
         return true;
     }
     stagingTex_.Reset();
@@ -274,7 +415,7 @@ bool GpuDeviceManager::ensureStagingTextureLocked(int width, int height) {
     desc.Height = static_cast<UINT>(height);
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.Format = fmt;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -284,6 +425,7 @@ bool GpuDeviceManager::ensureStagingTextureLocked(int width, int height) {
     }
     stagingW_ = width;
     stagingH_ = height;
+    stagingFmt_ = fmt;
     return true;
 }
 
@@ -298,7 +440,7 @@ bool GpuDeviceManager::readbackVramTextureToCpu(
         return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!device_ || !context_ || !ensureStagingTextureLocked(width, height)) {
+    if (!device_ || !context_ || !ensureStagingTextureLocked(width, height, DXGI_FORMAT_B8G8R8A8_UNORM)) {
         return false;
     }
 
@@ -329,12 +471,80 @@ bool GpuDeviceManager::readbackVramTextureToCpu(
     return true;
 }
 
-Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::acquireOutputTextureLocked(int width, int height) {
+bool GpuDeviceManager::readbackVramR10G10B10A2ToBgra32fCpu(
+    ID3D11Texture2D* vramR10Tex,
+    DXGI_FORMAT actualFmt,
+    int width,
+    int height,
+    uint8_t* dstCpuPixels,
+    int dstRowBytes,
+    bool flipVertical) {
+    if (!vramR10Tex || !dstCpuPixels || width <= 0 || height <= 0 || dstRowBytes == 0) {
+        return false;
+    }
+    if (actualFmt != DXGI_FORMAT_R10G10B10A2_UNORM && actualFmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!device_ || !context_ || !ensureStagingTextureLocked(width, height, actualFmt)) {
+        return false;
+    }
+
+    context_->CopyResource(stagingTex_.Get(), vramR10Tex);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped)) || !mapped.pData) {
+        return false;
+    }
+
+    const auto* srcBase = static_cast<const uint8_t*>(mapped.pData);
+    const ptrdiff_t signedDstStride = static_cast<ptrdiff_t>(dstRowBytes);
+
+    if (actualFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        constexpr float kInv1023 = 1.0f / 1023.0f;
+        constexpr float kInv3 = 1.0f / 3.0f;
+        for (int y = 0; y < height; ++y) {
+            const int dstY = flipVertical ? (height - 1 - y) : y;
+            const auto* srcRow = reinterpret_cast<const uint32_t*>(srcBase + static_cast<size_t>(y) * static_cast<size_t>(mapped.RowPitch));
+            auto* dstRow = reinterpret_cast<float*>(dstCpuPixels + static_cast<ptrdiff_t>(dstY) * signedDstStride);
+            for (int x = 0; x < width; ++x) {
+                const uint32_t p = srcRow[x];
+                dstRow[x * 4 + 0] = static_cast<float>((p >> 20) & 0x3FFu) * kInv1023; // B
+                dstRow[x * 4 + 1] = static_cast<float>((p >> 10) & 0x3FFu) * kInv1023; // G
+                dstRow[x * 4 + 2] = static_cast<float>(p & 0x3FFu) * kInv1023;         // R
+                dstRow[x * 4 + 3] = static_cast<float>((p >> 30) & 0x3u) * kInv3;      // A
+            }
+        }
+    } else {
+        constexpr float kInv255 = 1.0f / 255.0f;
+        for (int y = 0; y < height; ++y) {
+            const int dstY = flipVertical ? (height - 1 - y) : y;
+            const auto* srcRow = srcBase + static_cast<size_t>(y) * static_cast<size_t>(mapped.RowPitch);
+            auto* dstRow = reinterpret_cast<float*>(dstCpuPixels + static_cast<ptrdiff_t>(dstY) * signedDstStride);
+            for (int x = 0; x < width; ++x) {
+                dstRow[x * 4 + 0] = static_cast<float>(srcRow[x * 4 + 0]) * kInv255;
+                dstRow[x * 4 + 1] = static_cast<float>(srcRow[x * 4 + 1]) * kInv255;
+                dstRow[x * 4 + 2] = static_cast<float>(srcRow[x * 4 + 2]) * kInv255;
+                dstRow[x * 4 + 3] = static_cast<float>(srcRow[x * 4 + 3]) * kInv255;
+            }
+        }
+    }
+
+    context_->Unmap(stagingTex_.Get(), 0);
+    return true;
+}
+
+Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::acquireOutputTextureLocked(
+    int width, int height, DXGI_FORMAT fmt, UINT bindFlags) {
     for (auto it = vramTexPool_.begin(); it != vramTexPool_.end(); ++it) {
-        if (it->width == width && it->height == height && it->tex) {
-            auto reused = std::move(it->tex);
-            vramTexPool_.erase(it);
-            return reused;
+        if (it->width == width && it->height == height && it->fmt == fmt && it->tex) {
+            D3D11_TEXTURE2D_DESC existingDesc{};
+            it->tex->GetDesc(&existingDesc);
+            if (existingDesc.BindFlags == bindFlags) {
+                auto reused = std::move(it->tex);
+                vramTexPool_.erase(it);
+                return reused;
+            }
         }
     }
 
@@ -343,10 +553,10 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::acquireOutputTextureLo
     outDesc.Height = static_cast<UINT>(height);
     outDesc.MipLevels = 1;
     outDesc.ArraySize = 1;
-    outDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    outDesc.Format = fmt;
     outDesc.SampleDesc.Count = 1;
     outDesc.Usage = D3D11_USAGE_DEFAULT;
-    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    outDesc.BindFlags = bindFlags;
 
     Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex;
     if (FAILED(device_->CreateTexture2D(&outDesc, nullptr, outTex.GetAddressOf()))) {
@@ -355,14 +565,15 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::acquireOutputTextureLo
     return outTex;
 }
 
-void GpuDeviceManager::recycleVramTexture(Microsoft::WRL::ComPtr<ID3D11Texture2D> tex, int width, int height) {
+void GpuDeviceManager::recycleVramTexture(
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> tex, int width, int height, DXGI_FORMAT fmt) {
     if (!tex || width <= 0 || height <= 0) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    constexpr size_t kMaxPooledTextures = 6;
+    constexpr size_t kMaxPooledTextures = 10;
     if (vramTexPool_.size() >= kMaxPooledTextures) {
         vramTexPool_.erase(vramTexPool_.begin());
     }
-    vramTexPool_.push_back(PooledVramTex{width, height, std::move(tex)});
+    vramTexPool_.push_back(PooledVramTex{width, height, fmt, std::move(tex)});
 }
 
 void GpuDeviceManager::trimIdleResources() {
@@ -371,6 +582,7 @@ void GpuDeviceManager::trimIdleResources() {
     stagingTex_.Reset();
     stagingW_ = 0;
     stagingH_ = 0;
+    stagingFmt_ = DXGI_FORMAT_UNKNOWN;
 }
 
 } // namespace aer

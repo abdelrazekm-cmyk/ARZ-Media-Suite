@@ -6,10 +6,12 @@
 #include "media/VideoDecoder.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
   #if defined(AER_CORE_EXPORTS)
@@ -52,6 +54,7 @@ public:
     static size_t totalCachedVramFrames();
     static size_t totalCachedBytes();
     static size_t totalCachedFrames();
+    static void clearAllCaches();
 
     bool renderVideoFrame(int64_t frameNumber,
                           int outWidth,
@@ -78,6 +81,10 @@ public:
 private:
     VideoDecoder* ensureThumbnailDecoder();
     AudioDecoder* ensureAudioDecoder();
+    void startLookaheadWorker();
+    void stopLookaheadWorker();
+    void triggerLookahead(int64_t anchorFrame, int width, int height, PixelBufferFormat fmt, uint64_t generation);
+    void lookaheadLoop();
 
     static std::atomic<uint64_t> s_nextId_;
     uint64_t sessionId_ = 0;
@@ -88,6 +95,22 @@ private:
     std::unique_ptr<VideoDecoder> thumbDecoder_;
     std::mutex audioInitMutex_;
     std::unique_ptr<AudioDecoder> audioDecoder_;
+
+    // DaVinci Resolve-style Continuous GOP Lookahead Prefetcher
+    struct LookaheadTarget {
+        int64_t anchorFrame = -1;
+        int width = 0;
+        int height = 0;
+        PixelBufferFormat format = PixelBufferFormat::BGRA_8u;
+        uint64_t generation = 0;
+        bool active = false;
+    };
+    std::mutex lookaheadMutex_;
+    std::condition_variable lookaheadCv_;
+    LookaheadTarget lookaheadTarget_{};
+    bool lookaheadStop_ = false;
+    bool lookaheadRunning_ = false;
+    std::thread lookaheadThread_;
 };
 
 } // namespace aer

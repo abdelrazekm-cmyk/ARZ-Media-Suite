@@ -29,6 +29,32 @@ void copyCpuRows(uint8_t* dst,
     }
 }
 
+void copyBiPlanarCpu(uint8_t* dstBase,
+                     int dstRowBytes,
+                     const uint8_t* srcBase,
+                     int srcRowBytes,
+                     int width,
+                     int height,
+                     int bytesPerSample) {
+    const int absDstStride = std::abs(dstRowBytes);
+    const int copyBytes = width * bytesPerSample;
+    // Plane Y (top-down)
+    for (int y = 0; y < height; ++y) {
+        std::memcpy(dstBase + static_cast<size_t>(y) * static_cast<size_t>(absDstStride),
+                    srcBase + static_cast<size_t>(y) * static_cast<size_t>(srcRowBytes),
+                    static_cast<size_t>(copyBytes));
+    }
+    // Plane UV interleaved (top-down, H/2 rows)
+    uint8_t* dstUV = dstBase + static_cast<size_t>(absDstStride) * static_cast<size_t>(height);
+    const uint8_t* srcUV = srcBase + static_cast<size_t>(srcRowBytes) * static_cast<size_t>(height);
+    const int uvRows = height / 2;
+    for (int y = 0; y < uvRows; ++y) {
+        std::memcpy(dstUV + static_cast<size_t>(y) * static_cast<size_t>(absDstStride),
+                    srcUV + static_cast<size_t>(y) * static_cast<size_t>(srcRowBytes),
+                    static_cast<size_t>(copyBytes));
+    }
+}
+
 } // namespace
 
 size_t FrameCacheKeyHash::operator()(const FrameCacheKey& k) const noexcept {
@@ -62,7 +88,7 @@ uint64_t LRUFrameCache::computeDynamicRamBudgetBytes() {
     MEMORYSTATUSEX mem{};
     mem.dwLength = sizeof(mem);
     if (GlobalMemoryStatusEx(&mem)) {
-        const uint64_t pct = std::clamp<uint64_t>(cfg.maxPercentAvailableRam, 10ULL, 90ULL);
+        const uint64_t pct = std::clamp<uint64_t>(cfg.maxPercentAvailableRam, 5ULL, 80ULL);
         const uint64_t dynamicCap = (mem.ullAvailPhys * pct) / 100ULL;
         return std::min(configuredMax, dynamicCap);
     }
@@ -79,11 +105,14 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
                                        uint8_t* dstBuffer,
                                        int dstRowBytes,
                                        bool flipVertical) {
-    if (!AERConfig::instance().enableFrameCache || !dstBuffer) {
+    if (!AERConfig::instance().enableFrameCache) {
         return false;
     }
+    if (!dstBuffer) {
+        return hasCachedFrame(key);
+    }
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> vramHitTex;
+    CachedVramFrame vramHit{};
     std::shared_ptr<CachedVideoFrame> ramHitFrame;
 
     {
@@ -91,7 +120,7 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
         auto vit = vramIndex_.find(key);
         if (vit != vramIndex_.end()) {
             vramLru_.splice(vramLru_.begin(), vramLru_, vit->second);
-            vramHitTex = vit->second->second.texture;
+            vramHit = vit->second->second;
         } else {
             auto rit = ramIndex_.find(key);
             if (rit != ramIndex_.end()) {
@@ -101,12 +130,39 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
         }
     }
 
-    if (vramHitTex) {
+    if (vramHit.texture) {
+        if (key.format == PixelBufferFormat::NV12_8u || key.format == PixelBufferFormat::P010_10u) {
+            return GpuDeviceManager::instance().readbackVramYuvToCpu(
+                vramHit.texture.Get(),
+                vramHit.dxgiFormat,
+                key.width,
+                key.height,
+                vramHit.texAllocWidth,
+                vramHit.texAllocHeight,
+                dstBuffer,
+                dstRowBytes);
+        }
+        if (key.format == PixelBufferFormat::BGRA_32f) {
+            return GpuDeviceManager::instance().readbackVramR10G10B10A2ToBgra32fCpu(
+                vramHit.texture.Get(),
+                vramHit.dxgiFormat,
+                key.width,
+                key.height,
+                dstBuffer,
+                dstRowBytes,
+                flipVertical);
+        }
         return GpuDeviceManager::instance().readbackVramTextureToCpu(
-            vramHitTex.Get(), key.width, key.height, dstBuffer, dstRowBytes, flipVertical);
+            vramHit.texture.Get(), key.width, key.height, dstBuffer, dstRowBytes, flipVertical);
     }
 
     if (ramHitFrame) {
+        if (key.format == PixelBufferFormat::NV12_8u || key.format == PixelBufferFormat::P010_10u) {
+            const int bps = (key.format == PixelBufferFormat::P010_10u) ? 2 : 1;
+            copyBiPlanarCpu(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
+                            ramHitFrame->rowBytes, key.width, key.height, bps);
+            return true;
+        }
         const int tightBytes = key.width * (key.format == PixelBufferFormat::BGRA_32f ? 16 : 4);
         copyCpuRows(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
                     ramHitFrame->rowBytes, tightBytes, key.height, flipVertical);
@@ -116,12 +172,20 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
     return false;
 }
 
-void LRUFrameCache::putVramTexture(const FrameCacheKey& key, Microsoft::WRL::ComPtr<ID3D11Texture2D> tex) {
-    if (!tex || !AERConfig::instance().enableFrameCache || key.format != PixelBufferFormat::BGRA_8u) {
+void LRUFrameCache::putVramTexture(const FrameCacheKey& key,
+                                   Microsoft::WRL::ComPtr<ID3D11Texture2D> tex,
+                                   DXGI_FORMAT dxgiFormat,
+                                   int texAllocW,
+                                   int texAllocH) {
+    if (!tex || !AERConfig::instance().enableFrameCache) {
         return;
     }
 
-    const size_t texBytes = static_cast<size_t>(key.width) * static_cast<size_t>(key.height) * 4ULL;
+    const int allocW = texAllocW > 0 ? texAllocW : key.width;
+    const int allocH = texAllocH > 0 ? texAllocH : key.height;
+    const size_t texBytes = (key.format == PixelBufferFormat::BGRA_32f)
+                                ? (static_cast<size_t>(allocW) * static_cast<size_t>(allocH) * 4ULL) // Stored as compact 4-byte R10G10B10A2 in VRAM!
+                                : estimateTightFrameBytes(allocW, allocH, key.format);
     const auto& cfg = AERConfig::instance();
     const uint32_t maxVramPct = cfg.maxPercentVramBudget;
     const uint64_t ownCacheCapBytes = static_cast<uint64_t>(std::max<uint32_t>(64, cfg.maxVramCacheMB)) * 1024ULL * 1024ULL;
@@ -158,6 +222,9 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key, Microsoft::WRL::Com
         entry.frameNumber = key.frameNumber;
         entry.width = key.width;
         entry.height = key.height;
+        entry.texAllocWidth = allocW;
+        entry.texAllocHeight = allocH;
+        entry.dxgiFormat = dxgiFormat;
         entry.byteEstimate = texBytes;
         entry.texture = std::move(tex);
 
@@ -166,11 +233,10 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key, Microsoft::WRL::Com
         vramIndex_[key] = vramLru_.begin();
     }
 
-    // Recycle evicted GPU surfaces directly back to D3D11 pool (ZERO PCIe readback or RAM bloat!)
     auto& gpuMgr = GpuDeviceManager::instance();
     for (auto& v : evicted) {
         if (v.texture) {
-            gpuMgr.recycleVramTexture(std::move(v.texture), v.width, v.height);
+            gpuMgr.recycleVramTexture(std::move(v.texture), v.texAllocWidth, v.texAllocHeight, v.dxgiFormat);
         }
     }
 }
@@ -197,23 +263,33 @@ void LRUFrameCache::putRamFrame(const FrameCacheKey& key, std::shared_ptr<Cached
 }
 
 void LRUFrameCache::evictSession(uint64_t sessionId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = vramLru_.begin(); it != vramLru_.end();) {
-        if (it->first.sessionId == sessionId) {
-            currentVramBytes_ -= it->second.byteEstimate;
-            vramIndex_.erase(it->first);
-            it = vramLru_.erase(it);
-        } else {
-            ++it;
+    std::vector<CachedVramFrame> evicted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = vramLru_.begin(); it != vramLru_.end();) {
+            if (it->first.sessionId == sessionId) {
+                currentVramBytes_ -= it->second.byteEstimate;
+                vramIndex_.erase(it->first);
+                evicted.push_back(std::move(it->second));
+                it = vramLru_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = ramLru_.begin(); it != ramLru_.end();) {
+            if (it->first.sessionId == sessionId) {
+                currentRamBytes_ -= it->second->pixels.size();
+                ramIndex_.erase(it->first);
+                it = ramLru_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
-    for (auto it = ramLru_.begin(); it != ramLru_.end();) {
-        if (it->first.sessionId == sessionId) {
-            currentRamBytes_ -= it->second->pixels.size();
-            ramIndex_.erase(it->first);
-            it = ramLru_.erase(it);
-        } else {
-            ++it;
+    auto& gpuMgr = GpuDeviceManager::instance();
+    for (auto& v : evicted) {
+        if (v.texture) {
+            gpuMgr.recycleVramTexture(std::move(v.texture), v.texAllocWidth, v.texAllocHeight, v.dxgiFormat);
         }
     }
 }

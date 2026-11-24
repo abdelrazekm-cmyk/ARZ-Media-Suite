@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ARZ VERSION 1.1.0 LANGUAGES CXX)
+project(ARZ VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,8 +15,8 @@ set(FFMPEG_ROOT
     CACHE PATH "Path to FFmpeg 9.x win64 LGPL shared dev package")
 
 set(ARZ_INSTALL_DIR
-    "C:/Program Files/Adobe/Adobe Premiere Pro 2027/PlugIns/Common/ARZ"
-    CACHE PATH "Isolated Premiere Pro 27 ARZ plugin folder")
+    "C:/Program Files/Adobe/Common/Plug-ins/7.0/MediaCore/ARZ"
+    CACHE PATH "Shared Adobe MediaCore ARZ plugin folder (Premiere Pro, Media Encoder & After Effects)")
 
 if(NOT EXISTS "${PREMIERE_SDK_ROOT}/Examples/Headers/PrSDKImport.h")
     message(FATAL_ERROR "Premiere Pro 27.0 SDK headers not found at: ${PREMIERE_SDK_ROOT}")

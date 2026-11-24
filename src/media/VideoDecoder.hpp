@@ -47,6 +47,13 @@ public:
                      bool fastKeyframeScrub = false,
                      uint64_t expectedGeneration = 0);
 
+    // Non-blocking DaVinci-style GOP lookahead: decodes the next sequential frame into VRAM if idle
+    bool decodeNextLookaheadFrame(int outWidth,
+                                  int outHeight,
+                                  PixelBufferFormat outFormat,
+                                  uint64_t expectedGeneration,
+                                  int64_t& outDecodedFrameNum);
+
     int64_t nearestKeyframeFrame(int64_t frameNumber) const;
 
     void simulateHardwareFailureNextDecode() noexcept { forceSimulateHwFailure_ = true; }
@@ -113,6 +120,7 @@ private:
     bool quietedFromHardware_ = false;
     bool forceSimulateHwFailure_ = false;
     bool eofReached_ = false;
+    int consecutiveHwErrors_ = 0;
     int hwPixFmt_ = -1;
     int64_t currentPts_ = -1;
     int64_t currentFrameNumber_ = -1;

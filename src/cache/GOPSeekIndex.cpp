@@ -43,6 +43,9 @@ void GOPSeekIndex::importStreamIndexEntriesLocked(AVStream* stream) {
         return;
     }
     lastImportedIndexCount_ = count;
+    if (count > 1) {
+        cuesHarvested_.store(true, std::memory_order_release);
+    }
 
     keyframes_.reserve(static_cast<size_t>(std::max(count, 32)));
     for (int i = 0; i < count; ++i) {
@@ -80,6 +83,7 @@ void GOPSeekIndex::initializeFromStream(AVStream* stream,
     tbNum_ = tbNum > 0 ? tbNum : 1;
     tbDen_ = tbDen > 0 ? tbDen : 1000;
     lastImportedIndexCount_ = 0;
+    cuesHarvested_.store(false, std::memory_order_release);
     keyframes_.clear();
     observedFramePts_.clear();
 
@@ -87,7 +91,7 @@ void GOPSeekIndex::initializeFromStream(AVStream* stream,
 }
 
 void GOPSeekIndex::refreshFromStream(AVStream* stream) {
-    if (!stream) return;
+    if (!stream || cuesHarvested_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lock(mutex_);
     importStreamIndexEntriesLocked(stream);
 }

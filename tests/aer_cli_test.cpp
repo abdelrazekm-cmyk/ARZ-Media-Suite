@@ -259,20 +259,37 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     // -------------------------------------------------------------------------
-    // 3. DaVinci Resolve-Speed Fast Scrub + Lean Resource Footprint Benchmark
+    // 3. DaVinci Resolve-Speed Native P010/NV12 + GOP Lookahead + Scrub Cancel Guard
     // -------------------------------------------------------------------------
     if (argc >= 2) {
-        std::cout << "\n=== 3. DaVinci Resolve-Speed 4K MKV Scrubbing & Resource Benchmark ===\n";
+        std::cout << "\n=== 3. ARZ v1.2.0 Native P010 GPU + GOP Lookahead + Scrub Benchmark ===\n";
+        aer::AERSession::clearAllCaches();
         aer::AERSession session;
         if (!session.open(argv[1], true)) {
             std::cerr << "[FAIL] Could not open target MKV movie.\n";
             return 30;
         }
         const auto& m = session.metadata();
-        std::vector<uint8_t> frameBuf(static_cast<size_t>(m.width) * m.height * 4ULL);
+        const aer::PixelBufferFormat nativeFmt =
+            (m.bitDepth > 8) ? aer::PixelBufferFormat::P010_10u : aer::PixelBufferFormat::NV12_8u;
+        const int nativeStride = m.width * (m.bitDepth > 8 ? 2 : 1);
+        std::vector<uint8_t> yuvBuf(aer::estimateTightFrameBytes(m.width, m.height, nativeFmt));
 
-        session.renderVideoFrame(m.totalFrames / 2, m.width, m.height, m.width * 4,
-                                 aer::PixelBufferFormat::BGRA_8u, frameBuf.data(), true, true);
+        // 3A. Test scrub cancellation NEVER drops GPU session to CPU!
+        const uint64_t staleGen = session.currentScrubGeneration();
+        session.bumpScrubGeneration();
+        session.renderVideoFrame(m.totalFrames / 3, m.width, m.height, nativeStride,
+                                 nativeFmt, yuvBuf.data(), false, false, staleGen);
+        if (!session.isUsingHardwareDecode()) {
+            std::cerr << "[FAIL] Scrub cancellation falsely dropped session from GPU to CPU!\n";
+            return 33;
+        }
+        std::cout << "  [OK] Scrub-Cancel Guard: Cancelled GOP seek kept GPU session active ("
+                  << session.activeVideoBackend() << ")\n";
+
+        // 3B. Warm MKV Cues once, then measure 5 rapid native P010/NV12 scrub jumps!
+        session.renderVideoFrame(m.totalFrames / 2, m.width, m.height, nativeStride,
+                                 nativeFmt, yuvBuf.data(), false, true);
 
         const int64_t scrubTargets[] = {
             (m.totalFrames * 15) / 100,
@@ -283,15 +300,41 @@ int wmain(int argc, wchar_t* argv[]) {
         };
         auto t0 = std::chrono::steady_clock::now();
         for (int64_t f : scrubTargets) {
-            if (!session.renderVideoFrame(f, m.width, m.height, m.width * 4,
-                                          aer::PixelBufferFormat::BGRA_8u, frameBuf.data(),
-                                          /*flipVertical=*/true, /*fastKeyframeScrub=*/true)) {
-                std::cerr << "[FAIL] Fast scrub failed at frame " << f << "\n";
+            if (!session.renderVideoFrame(f, m.width, m.height, nativeStride,
+                                          nativeFmt, yuvBuf.data(),
+                                          /*flipVertical=*/false, /*fastKeyframeScrub=*/true)) {
+                std::cerr << "[FAIL] Native P010/NV12 fast scrub failed at frame " << f << "\n";
                 return 31;
             }
         }
         auto t1 = std::chrono::steady_clock::now();
         const double avgScrubMs = std::chrono::duration<double, std::milli>(t1 - t0).count() / 5.0;
+
+        // 3C. Test Continuous GOP Lookahead Prefetch (frame N triggers background N+1..N+6 in VRAM!)
+        const int64_t baseFrame = 240;
+        if (!session.renderVideoFrame(baseFrame, m.width, m.height, nativeStride,
+                                      nativeFmt, yuvBuf.data(), false, false)) {
+            std::cerr << "[FAIL] Exact P010 frame decode failed!\n";
+            return 34;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        auto lt0 = std::chrono::steady_clock::now();
+        for (int step = 1; step <= 4; ++step) {
+            if (!session.renderVideoFrame(baseFrame + step, m.width, m.height, nativeStride,
+                                          nativeFmt, yuvBuf.data(), false, false)) {
+                return 35;
+            }
+        }
+        auto lt1 = std::chrono::steady_clock::now();
+        const double lookaheadStepMs = std::chrono::duration<double, std::milli>(lt1 - lt0).count() / 4.0;
+
+        // 3D. Test 4K 10-bit BGRA_32f ALSO runs 100% on GPU (ZERO CPU RAM overflow!)
+        std::vector<uint8_t> float32Buf(static_cast<size_t>(m.width) * m.height * 16ULL);
+        if (!session.renderVideoFrame(baseFrame + 1, m.width, m.height, m.width * 16,
+                                      aer::PixelBufferFormat::BGRA_32f, float32Buf.data(), true, false)) {
+            std::cerr << "[FAIL] GPU BGRA_32f conversion failed!\n";
+            return 36;
+        }
 
         // Verify thumbnail decode does NOT open a second GPU hardware decoder stream!
         std::vector<uint8_t> thumbBuf(160ULL * 90ULL * 4ULL);
@@ -300,15 +343,17 @@ int wmain(int argc, wchar_t* argv[]) {
         const size_t vramMB = aer::AERSession::totalCachedVramBytes() / (1024ULL * 1024ULL);
         const size_t ramMB = aer::AERSession::totalCachedBytes() / (1024ULL * 1024ULL);
 
-        std::cout << "  Average 4K 10-bit Fast-Scrub Jump across 2.5h MKV : " << avgScrubMs << " ms/jump!\n";
-        std::cout << "  Active GPU Decode Streams (incl. Thumbnail)       : " << gpuStreams << " (Zero extra GPU session for thumbs!)\n";
-        std::cout << "  Cached VRAM / RAM Footprint                       : VRAM=" << vramMB << " MB (cap 384 MB), RAM=" << ramMB << " MB (Zero PCIe spill!)\n";
-        if (gpuStreams > 1 || vramMB > 390) {
-            std::cerr << "[FAIL] Resource cap exceeded! gpuStreams=" << gpuStreams << " vramMB=" << vramMB << "\n";
+        std::cout << "  Average 4K 10-bit Native P010 Fast-Scrub Jump     : " << avgScrubMs << " ms/jump!\n";
+        std::cout << "  GOP Lookahead Sequential Playback Latency (4K)    : " << lookaheadStepMs << " ms/frame!\n";
+        std::cout << "  Active GPU Decode Streams (incl. Thumbnail)       : " << gpuStreams << " (Shared Session + Zero thumb GPU!)\n";
+        std::cout << "  Cached VRAM / CPU-RAM Footprint                   : VRAM=" << vramMB << " MB (cap 384 MB), CPU-RAM=" << ramMB << " MB (ZERO CPU swscale!)\n";
+        if (gpuStreams > 1 || vramMB > 390 || ramMB > 0) {
+            std::cerr << "[FAIL] Unexpected CPU RAM fallback or resource cap exceeded! gpuStreams="
+                      << gpuStreams << " vramMB=" << vramMB << " ramMB=" << ramMB << "\n";
             return 32;
         }
     }
 
-    std::cout << "\n[PASS] ALL ARZ v1.1.0 Turbo Exporter + Lean Resource + Scrubbing Tests Passed!\n";
+    std::cout << "\n[PASS] ALL ARZ v1.2.0 Native P010 GPU + GOP Lookahead + Shared MediaCore Tests Passed!\n";
     return 0;
 }

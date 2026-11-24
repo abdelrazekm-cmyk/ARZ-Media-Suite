@@ -110,12 +110,14 @@ void loadConfigState() {
 bool saveConfigState() {
     std::ofstream out(getConfigPath(), std::ios::trunc);
     if (!out.is_open()) return false;
-    out << "# ARZ Media Suite v1.0.0 Configuration\n"
+    out << "# ARZ Media Suite v1.2.0 Configuration\n"
         << "enableHardwareDecode=" << (g_state.hwDecode ? "true" : "false") << "\n"
         << "enableGpuColorConvert=" << (g_state.gpuColor ? "true" : "false") << "\n"
         << "selectiveOverride=" << (g_state.selectiveOverride ? "true" : "false") << "\n"
         << "enableFrameCache=" << (g_state.frameCache ? "true" : "false") << "\n"
-        << "maxPercentVramBudget=82\n";
+        << "maxPercentVramBudget=78\n"
+        << "maxVramCacheMB=384\n"
+        << "maxRamCacheMB=512\n";
     return true;
 }
 
@@ -123,7 +125,8 @@ int clearAdobePluginCaches() {
     int cleared = 0;
     const wchar_t* roots[] = {
         L"Software\\Adobe\\Premiere Pro",
-        L"Software\\Adobe\\Adobe Media Encoder"
+        L"Software\\Adobe\\Adobe Media Encoder",
+        L"Software\\Adobe\\After Effects"
     };
     for (const wchar_t* r : roots) {
         HKEY hRoot = nullptr;
