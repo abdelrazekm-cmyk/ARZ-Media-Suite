@@ -1,0 +1,22 @@
+{
+  "name": "aer-importer",
+  "version-string": "0.1.0",
+  "description": "AER — Clean-room AV1 & multi-format importer plugin for Adobe Premiere Pro 27",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swresample",
+        "swscale",
+        "dav1d",
+        "vpx",
+        "opus",
+        "vorbis",
+        "zlib"
+      ]
+    }
+  ]
+}

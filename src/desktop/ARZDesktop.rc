@@ -1,0 +1,26 @@
+#include <winresrc.h>
+
+101 ICON   "D:/AV1/AER/resources/arz.ico"
+102 BITMAP "D:/AV1/AER/resources/arz_banner.bmp"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName", "ARZ Media Technologies\0"
+            VALUE "FileDescription", "ARZ Control Center & Live GPU Telemetry\0"
+            VALUE "InternalName", "ARZDesktop\0"
+            VALUE "OriginalFilename", "ARZDesktop.exe\0"
+            VALUE "ProductName", "ARZ Media Suite\0"
+            VALUE "FileVersion", "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1252
+    END
+END

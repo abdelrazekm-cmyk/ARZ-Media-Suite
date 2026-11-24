@@ -1,0 +1,57 @@
+#include <winresrc.h>
+
+101 ICON "D:/AV1/AER/resources/arz.ico"
+
+1000 IMPT DISCARDABLE
+BEGIN
+#if AER_HIGH_PRIORITY
+    0x5241, 0x485A
+#else
+    0x5241, 0x205A
+#endif
+END
+
+16000 PIPL DISCARDABLE
+BEGIN
+    0x0001, 0x0000, 0x0000, 0x0003, 0x0000,
+    // Property 1: '8BIM' / 'kind' = 'IMPT'
+    0x494D, 0x3842, 0x6E64, 0x6B69, 0x0000, 0x0000, 0x0004, 0x0000, 0x5054, 0x494D,
+    // Property 2: '8BIM' / 'name' = "ARZ" (or "ARZ " for HP to avoid PiPL cache collision)
+    0x494D, 0x3842, 0x6D65, 0x6E61, 0x0000, 0x0000, 0x0008, 0x0000,
+#if AER_HIGH_PRIORITY
+    0x4104, 0x5A52, 0x0020, 0x0000,
+#else
+    0x4103, 0x5A52, 0x0000, 0x0000,
+#endif
+    // Property 3: '8BIM' / 'eMNA' (Match Name) = "ARZ"
+    0x494D, 0x3842, 0x4E41, 0x654D, 0x0000, 0x0000, 0x0008, 0x0000,
+    0x4103, 0x5A52, 0x0000, 0x0000
+END
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName", "ARZ Media Technologies\0"
+#if AER_HIGH_PRIORITY
+            VALUE "FileDescription", "ARZ High-Priority AV1 & Pro Media Importer for Premiere Pro 27\0"
+            VALUE "InternalName", "ARZ_HP\0"
+            VALUE "OriginalFilename", "ARZ_HP.prm\0"
+#else
+            VALUE "FileDescription", "ARZ Universal AV1 & Pro Media Importer for Premiere Pro 27\0"
+            VALUE "InternalName", "ARZ\0"
+            VALUE "OriginalFilename", "ARZ.prm\0"
+#endif
+            VALUE "ProductName", "ARZ Media Suite\0"
+            VALUE "FileVersion", "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1252
+    END
+END

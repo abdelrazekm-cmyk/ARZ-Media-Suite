@@ -1,0 +1,27 @@
+#include <winresrc.h>
+
+101 ICON   "D:/AV1/AER/resources/arz.ico"
+102 BITMAP "D:/AV1/AER/resources/arz_banner.bmp"
+201 RCDATA "D:/AV1/AER/dist/ARZ-PremierePlugin-v1.0.0-Windows-x64-Portable.zip"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName", "ARZ Media Technologies\0"
+            VALUE "FileDescription", "ARZ Media Suite v1.0.0 Standalone Setup Installer\0"
+            VALUE "InternalName", "ARZ_Setup\0"
+            VALUE "OriginalFilename", "ARZ-PremierePlugin-v1.0.0-Windows-x64-Setup.exe\0"
+            VALUE "ProductName", "ARZ Media Suite\0"
+            VALUE "FileVersion", "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1252
+    END
+END
