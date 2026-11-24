@@ -84,15 +84,8 @@ LRUFrameCache::~LRUFrameCache() {
 
 uint64_t LRUFrameCache::computeDynamicRamBudgetBytes() {
     const auto& cfg = AERConfig::instance();
-    const uint64_t configuredMax = static_cast<uint64_t>(cfg.maxRamCacheMB) * 1024ULL * 1024ULL;
-    MEMORYSTATUSEX mem{};
-    mem.dwLength = sizeof(mem);
-    if (GlobalMemoryStatusEx(&mem)) {
-        const uint64_t pct = std::clamp<uint64_t>(cfg.maxPercentAvailableRam, 5ULL, 80ULL);
-        const uint64_t dynamicCap = (mem.ullAvailPhys * pct) / 100ULL;
-        return std::min(configuredMax, dynamicCap);
-    }
-    return configuredMax;
+    const VramStatus vst = GpuDeviceManager::instance().queryVramStatus(0);
+    return cfg.computeAdaptiveBudgets(vst.budgetBytes, vst.currentUsageBytes, 0).l2RamCacheBytes;
 }
 
 bool LRUFrameCache::hasCachedFrame(const FrameCacheKey& key) const {
@@ -117,17 +110,31 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto vit = vramIndex_.find(key);
-        if (vit != vramIndex_.end()) {
-            vramLru_.splice(vramLru_.begin(), vramLru_, vit->second);
-            vramHit = vit->second->second;
+        // Check L2 System RAM History FIRST (0.08 ms DDR5 memcpy — zero GPU lock or PCIe transfer on back & forth scrub!)
+        auto rit = ramIndex_.find(key);
+        if (rit != ramIndex_.end()) {
+            ramLru_.splice(ramLru_.begin(), ramLru_, rit->second);
+            ramHitFrame = rit->second->second;
         } else {
-            auto rit = ramIndex_.find(key);
-            if (rit != ramIndex_.end()) {
-                ramLru_.splice(ramLru_.begin(), ramLru_, rit->second);
-                ramHitFrame = rit->second->second;
+            auto vit = vramIndex_.find(key);
+            if (vit != vramIndex_.end()) {
+                vramLru_.splice(vramLru_.begin(), vramLru_, vit->second);
+                vramHit = vit->second->second;
             }
         }
+    }
+
+    if (ramHitFrame) {
+        if (key.format == PixelBufferFormat::NV12_8u || key.format == PixelBufferFormat::P010_10u) {
+            const int bps = (key.format == PixelBufferFormat::P010_10u) ? 2 : 1;
+            copyBiPlanarCpu(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
+                            ramHitFrame->rowBytes, key.width, key.height, bps);
+            return true;
+        }
+        const int tightBytes = key.width * (key.format == PixelBufferFormat::BGRA_32f ? 16 : 4);
+        copyCpuRows(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
+                    ramHitFrame->rowBytes, tightBytes, key.height, flipVertical);
+        return true;
     }
 
     if (vramHit.texture) {
@@ -152,21 +159,13 @@ bool LRUFrameCache::tryReadCachedFrame(const FrameCacheKey& key,
                 dstRowBytes,
                 flipVertical);
         }
-        return GpuDeviceManager::instance().readbackVramTextureToCpu(
+        const bool ok = GpuDeviceManager::instance().readbackVramTextureToCpu(
             vramHit.texture.Get(), key.width, key.height, dstBuffer, dstRowBytes, flipVertical);
-    }
-
-    if (ramHitFrame) {
-        if (key.format == PixelBufferFormat::NV12_8u || key.format == PixelBufferFormat::P010_10u) {
-            const int bps = (key.format == PixelBufferFormat::P010_10u) ? 2 : 1;
-            copyBiPlanarCpu(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
-                            ramHitFrame->rowBytes, key.width, key.height, bps);
-            return true;
+        if (ok) {
+            // Zero-Cost Write-Through: frame is already on CPU — promote into L2 DDR5 bi-directional scrub history!
+            cacheCpuDeliveredBgra8InRam(key, dstBuffer, dstRowBytes, flipVertical);
         }
-        const int tightBytes = key.width * (key.format == PixelBufferFormat::BGRA_32f ? 16 : 4);
-        copyCpuRows(dstBuffer, dstRowBytes, ramHitFrame->pixels.data(),
-                    ramHitFrame->rowBytes, tightBytes, key.height, flipVertical);
-        return true;
+        return ok;
     }
 
     return false;
@@ -188,7 +187,6 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key,
                                 : estimateTightFrameBytes(allocW, allocH, key.format);
     const auto& cfg = AERConfig::instance();
     const uint32_t maxVramPct = cfg.maxPercentVramBudget;
-    const uint64_t ownCacheCapBytes = static_cast<uint64_t>(std::max<uint32_t>(64, cfg.maxVramCacheMB)) * 1024ULL * 1024ULL;
 
     std::vector<CachedVramFrame> evicted;
     {
@@ -202,6 +200,9 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key,
         }
 
         const VramStatus vst = GpuDeviceManager::instance().queryVramStatus(currentVramBytes_);
+        const AdaptiveHardwareBudgets adaptive =
+            cfg.computeAdaptiveBudgets(vst.budgetBytes, vst.currentUsageBytes, currentVramBytes_);
+        const uint64_t ownCacheCapBytes = adaptive.l1VramCacheBytes;
         const uint64_t sysCeiling = vst.valid ? vst.effectiveCeilingBytes(maxVramPct) : UINT64_MAX;
         uint64_t projectedSysUsage = vst.valid ? (vst.currentUsageBytes + texBytes) : 0;
 
@@ -301,6 +302,7 @@ void LRUFrameCache::clear() {
     currentVramBytes_ = 0;
     ramIndex_.clear();
     ramLru_.clear();
+    recycledRamBuffers_.clear();
     currentRamBytes_ = 0;
 }
 
@@ -324,12 +326,71 @@ size_t LRUFrameCache::totalRamEntries() const {
     return ramIndex_.size();
 }
 
+void LRUFrameCache::cacheCpuDeliveredBgra8InRam(const FrameCacheKey& key,
+                                                const uint8_t* deliveredPixels,
+                                                int deliveredRowBytes,
+                                                bool deliveredIsBottomUp) {
+    if (!deliveredPixels || deliveredRowBytes == 0 || key.format != PixelBufferFormat::BGRA_8u ||
+        !AERConfig::instance().enableFrameCache || key.width <= 640) {
+        return;
+    }
+    const size_t tightBytes = static_cast<size_t>(key.width) * 4ULL;
+    const size_t totalBytes = tightBytes * static_cast<size_t>(key.height);
+    const uint64_t budget = computeDynamicRamBudgetBytes();
+    if (totalBytes > budget) {
+        return;
+    }
+
+    std::shared_ptr<CachedVideoFrame> frameBuf;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (ramIndex_.find(key) != ramIndex_.end()) {
+            return;
+        }
+        for (auto it = recycledRamBuffers_.begin(); it != recycledRamBuffers_.end(); ++it) {
+            if ((*it)->pixels.size() == totalBytes) {
+                frameBuf = std::move(*it);
+                recycledRamBuffers_.erase(it);
+                break;
+            }
+        }
+    }
+
+    if (!frameBuf) {
+        frameBuf = std::make_shared<CachedVideoFrame>();
+        frameBuf->pixels.resize(totalBytes);
+    }
+    frameBuf->frameNumber = key.frameNumber;
+    frameBuf->width = key.width;
+    frameBuf->height = key.height;
+    frameBuf->rowBytes = static_cast<int>(tightBytes);
+    frameBuf->format = PixelBufferFormat::BGRA_8u;
+
+    // Normalize into top-down layout inside L2 RAM cache
+    const ptrdiff_t signedSrcStride = static_cast<ptrdiff_t>(deliveredRowBytes);
+    if (!deliveredIsBottomUp && deliveredRowBytes == static_cast<int>(tightBytes)) {
+        std::memcpy(frameBuf->pixels.data(), deliveredPixels, totalBytes);
+    } else {
+        for (int y = 0; y < key.height; ++y) {
+            const int srcY = (deliveredIsBottomUp && deliveredRowBytes > 0) ? (key.height - 1 - y) : y;
+            std::memcpy(frameBuf->pixels.data() + static_cast<size_t>(y) * tightBytes,
+                        deliveredPixels + static_cast<ptrdiff_t>(srcY) * signedSrcStride,
+                        tightBytes);
+        }
+    }
+
+    putRamFrame(key, std::move(frameBuf));
+}
+
 void LRUFrameCache::trimRamToBudgetLocked(uint64_t budgetBytes) {
     while (currentRamBytes_ > budgetBytes && !ramLru_.empty()) {
-        const auto& victim = ramLru_.back();
+        auto victim = std::move(ramLru_.back());
+        ramLru_.pop_back();
         currentRamBytes_ -= victim.second->pixels.size();
         ramIndex_.erase(victim.first);
-        ramLru_.pop_back();
+        if (recycledRamBuffers_.size() < 12 && victim.second.use_count() == 1) {
+            recycledRamBuffers_.push_back(std::move(victim.second));
+        }
     }
 }
 

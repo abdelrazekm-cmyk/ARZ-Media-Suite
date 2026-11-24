@@ -160,7 +160,7 @@ bool createDesktopShortcut(const std::wstring& targetExe) {
 }
 
 bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::wstring& outErr) {
-    appendLogLine(L"[1/5] Checking embedded standalone ARZ v1.2.1 payload...");
+    appendLogLine(L"[1/5] Checking embedded standalone ARZ v1.3.0 payload...");
     HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_PAYLOAD_ZIP), RT_RCDATA);
     if (!hRes) {
         outErr = L"[ERROR] Embedded payload resource (#201) is missing from Setup.exe.";
@@ -259,7 +259,7 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
     }
 
     appendLogLine(L"==================================================================");
-    appendLogLine(L"[SUCCESS] تم تثبيت ARZ Media Suite v1.2.1 في مسار MediaCore المشترك بنجاح!");
+    appendLogLine(L"[SUCCESS] تم تثبيت ARZ Media Suite v1.3.0 في مسار MediaCore المشترك بنجاح!");
     appendLogLine(L"          متاح الآن تلقائياً في Premiere Pro و Media Encoder و After Effects.");
     appendLogLine(L"==================================================================");
     g_installedDir = dst.wstring();
@@ -451,7 +451,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"ARZ Media Suite v1.2.1 — Shared MediaCore Setup",
+        0, wc.lpszClassName, L"ARZ Media Suite v1.3.0 — Shared MediaCore Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 680, 505,
         nullptr, nullptr, hInst, nullptr);

@@ -11,10 +11,10 @@ $legacyDirs = @(
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host "Requesting Administrator privileges to install ARZ v1.2.1 into shared Adobe MediaCore..." -ForegroundColor Yellow
+    Write-Host "Requesting Administrator privileges to install ARZ v1.3.0 into shared Adobe MediaCore..." -ForegroundColor Yellow
     Start-Process powershell.exe -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     if ((Test-Path (Join-Path $dstDir "ARZ.prm")) -and (Test-Path (Join-Path $dstDir "ARZ_Exporter.prm"))) {
-        Write-Host "[OK] Verified ARZ v1.2.1 is installed in shared MediaCore (Premiere Pro + Media Encoder + After Effects): $dstDir" -ForegroundColor Green
+        Write-Host "[OK] Verified ARZ v1.3.0 is installed in shared MediaCore (Premiere Pro + Media Encoder + After Effects): $dstDir" -ForegroundColor Green
         Get-ChildItem $dstDir | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
     } else {
         Write-Host "[ERROR] Installation did not complete or UAC prompt was cancelled." -ForegroundColor Red
@@ -49,5 +49,5 @@ foreach ($adobeRoot in @("HKCU:\Software\Adobe\Premiere Pro", "HKCU:\Software\Ad
     }
 }
 
-Write-Host "Successfully installed ARZ v1.2.1 into shared MediaCore and refreshed PluginCache: $dstDir" -ForegroundColor Green
+Write-Host "Successfully installed ARZ v1.3.0 into shared MediaCore and refreshed PluginCache: $dstDir" -ForegroundColor Green
 Get-ChildItem $dstDir | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize

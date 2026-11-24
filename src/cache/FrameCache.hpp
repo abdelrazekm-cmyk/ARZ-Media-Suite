@@ -90,6 +90,11 @@ public:
                         int texAllocW = 0,
                         int texAllocH = 0);
     void putRamFrame(const FrameCacheKey& key, std::shared_ptr<CachedVideoFrame> frame);
+    // Zero-cost write-through into L2 System RAM using recycled frame buffers when a frame is already on CPU!
+    void cacheCpuDeliveredBgra8InRam(const FrameCacheKey& key,
+                                     const uint8_t* deliveredPixels,
+                                     int deliveredRowBytes,
+                                     bool deliveredIsBottomUp);
 
     void evictSession(uint64_t sessionId);
     void clear();
@@ -114,6 +119,7 @@ private:
     using RamListEntry = std::pair<FrameCacheKey, std::shared_ptr<CachedVideoFrame>>;
     std::list<RamListEntry> ramLru_;
     std::unordered_map<FrameCacheKey, decltype(ramLru_)::iterator, FrameCacheKeyHash> ramIndex_;
+    std::vector<std::shared_ptr<CachedVideoFrame>> recycledRamBuffers_;
     size_t currentRamBytes_ = 0;
 };
 

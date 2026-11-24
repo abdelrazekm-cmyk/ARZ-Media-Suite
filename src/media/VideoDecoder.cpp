@@ -238,7 +238,14 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
          par->codec_id == AV_CODEC_ID_MPEG2VIDEO ||
          par->codec_id == AV_CODEC_ID_MJPEG);
 
-    if (allowHardware && AERConfig::instance().enableHardwareDecode && hwEligibleCodec && !isStillPicture) {
+    const auto& cfgRef = AERConfig::instance();
+    const VramStatus liveVst = GpuDeviceManager::instance().queryVramStatus(LRUFrameCache::instance().totalVramBytes());
+    const AdaptiveHardwareBudgets adaptive =
+        cfgRef.computeAdaptiveBudgets(liveVst.budgetBytes, liveVst.currentUsageBytes, LRUFrameCache::instance().totalVramBytes());
+    const bool smallSecondaryLayerSpill =
+        cfgRef.enableAdaptiveGovernor && (meta_.width * meta_.height <= 1280 * 720) && (activeHardwareStreamCount() >= 5);
+
+    if (allowHardware && cfgRef.enableHardwareDecode && hwEligibleCodec && !isStillPicture && !smallSecondaryLayerSpill) {
         if (!hasDynamicVramHeadroomLocked()) {
             fallbackReason_ = "vram_full_spilled_to_ram_cpu";
         } else {
@@ -294,6 +301,8 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
                 fallbackReason_ = "no_compatible_gpu_backend";
             }
         }
+    } else if (smallSecondaryLayerSpill) {
+        fallbackReason_ = "governor_balanced_small_layer_to_cpu";
     } else if (preserveAlphaInSw) {
         fallbackReason_ = "alpha_channel_preserved_multithread";
     } else if (!AERConfig::instance().enableHardwareDecode) {
@@ -347,7 +356,7 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
             av_dict_set_int(&opts, "framethreads", 1, 0);
         }
     } else if (AERConfig::instance().enableMultithreading) {
-        const int hwThreads = std::clamp(av_cpu_count(), 2, 12);
+        const int hwThreads = adaptive.maxSwDecodeThreads;
         codecCtx_->thread_count = hwThreads;
         codecCtx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         if (std::string(decoder->name) == "libdav1d") {
@@ -607,10 +616,16 @@ bool VideoDecoder::materializeAndCacheFrameLocked(const AVFrame* decodedFrame,
                 } else {
                     ok = GpuDeviceManager::instance().readbackVramTextureToCpu(
                         vramTex.Get(), outWidth, outHeight, optionalCpuDst, outRowBytes, flipVertical);
-                    if (ok && !flipVertical && outWidth <= 640 && outHeight <= 640 && outRowBytes == outWidth * 4) {
-                        ThumbnailCache::storeBGRA8(
-                            filePath_, outWidth, outHeight, frameNumber,
-                            optionalCpuDst, static_cast<size_t>(outRowBytes) * static_cast<size_t>(outHeight));
+                    if (ok) {
+                        if (!flipVertical && outWidth <= 640 && outHeight <= 640 && outRowBytes == outWidth * 4) {
+                            ThumbnailCache::storeBGRA8(
+                                filePath_, outWidth, outHeight, frameNumber,
+                                optionalCpuDst, static_cast<size_t>(outRowBytes) * static_cast<size_t>(outHeight));
+                        } else if (outWidth > 640) {
+                            // Zero-Cost Write-Through: frame is already on CPU — save into L2 DDR5 scrub history!
+                            LRUFrameCache::instance().cacheCpuDeliveredBgra8InRam(
+                                cacheKey, optionalCpuDst, outRowBytes, flipVertical);
+                        }
                     }
                 }
             }
@@ -726,7 +741,9 @@ bool VideoDecoder::convertSwAVFrameToTargetLocked(const AVFrame* src,
         av_opt_set_int(swsCtx_, "dst_format", targetAvFmt, 0);
         av_opt_set_int(swsCtx_, "sws_flags", SWS_BILINEAR, 0);
         if (AERConfig::instance().enableMultithreading && !lowResourceThumbMode_) {
-            av_opt_set_int(swsCtx_, "threads", std::clamp(av_cpu_count() / 2, 1, 8), 0);
+            const VramStatus vst = GpuDeviceManager::instance().queryVramStatus(0);
+            const int auxThreads = AERConfig::instance().computeAdaptiveBudgets(vst.budgetBytes, vst.currentUsageBytes, 0).maxAuxCpuThreads;
+            av_opt_set_int(swsCtx_, "threads", auxThreads, 0);
         }
         if (sws_init_context(swsCtx_, nullptr, nullptr) < 0) {
             resetScalerLocked();

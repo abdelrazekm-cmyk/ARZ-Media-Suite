@@ -1,6 +1,6 @@
 <div align="center">
   <img src="resources/arz_logo.jpg" alt="ARZ Media Suite Logo" width="320"/>
-  <h1>ARZ Media Suite v1.2.1</h1>
+  <h1>ARZ Media Suite v1.3.0</h1>
   <p><b>Zero-CPU Native P010/NV12 GPU Importer & 300+ FPS Turbo RTX Exporter for Adobe Premiere Pro, Media Encoder & After Effects</b></p>
 </div>
 
@@ -8,9 +8,9 @@
 
 ## Overview | نظرة عامة
 
-**ARZ Media Suite (`v1.2.1`)** is a standalone, zero-dependency Windows x64 C++20 MediaCore suite built with **static C++ runtime (`/MT`)** and **FFmpeg 9.1+**, delivering **Zero-CPU Native Bi-Planar `NV12` & `P010` GPU frame delivery**, DaVinci Resolve-style **Continuous GOP Lookahead Prefetch**, shared **`MediaCore` integration across Premiere Pro, Media Encoder, and After Effects**, and **`302+ FPS` Zero-Swscale Async Exporting**.
+**ARZ Media Suite (`v1.3.0`)** is a standalone, zero-dependency Windows x64 C++20 MediaCore suite built with **static C++ runtime (`/MT`)** and **FFmpeg 9.1+**, delivering **Zero-CPU Native Bi-Planar `NV12` & `P010` GPU frame delivery**, DaVinci Resolve-style **Continuous GOP Lookahead Prefetch**, shared **`MediaCore` integration across Premiere Pro, Media Encoder, and After Effects**, and **`302+ FPS` Zero-Swscale Async Exporting**.
 
-حزمة **`ARZ Media Suite v1.2.1`** هي إضافة مستقلة بالكامل لبرامج **Adobe Premiere Pro** و**Media Encoder** و**After Effects** عبر مسار **`MediaCore\ARZ`** الموحد بدون أي متطلبات خارجية، مع تسليم عتادي مباشر بصيغ **`NV12` و`P010`** لتصفير استهلاك المعالج على التايملاين، وتحضير مسبق مستمر للفريمات (`GOP Lookahead`)، ومصدّر فائق السرعة (`300+ FPS`).
+حزمة **`ARZ Media Suite v1.3.0`** هي إضافة مستقلة بالكامل لبرامج **Adobe Premiere Pro** و**Media Encoder** و**After Effects** عبر مسار **`MediaCore\ARZ`** الموحد بدون أي متطلبات خارجية، مع تسليم عتادي مباشر بصيغ **`NV12` و`P010`** لتصفير استهلاك المعالج على التايملاين، وتحضير مسبق مستمر للفريمات (`GOP Lookahead`)، ومصدّر فائق السرعة (`300+ FPS`).
 
 ---
 
@@ -33,7 +33,7 @@
 ## Quick Client Installation | التثبيت السريع للعميل
 
 1. Close **Adobe Premiere Pro** and **Adobe Media Encoder**.
-2. Download and run **`ARZ-PremierePlugin-v1.2.1-Windows-x64-Setup.exe`** from **Releases** (100% self-contained with live visual verification log — automatically installs into shared `MediaCore\ARZ` for Premiere Pro, Media Encoder & After Effects!).
+2. Download and run **`ARZ-PremierePlugin-v1.3.0-Windows-x64-Setup.exe`** from **Releases** (100% self-contained with live visual verification log — automatically installs into shared `MediaCore\ARZ` for Premiere Pro, Media Encoder & After Effects!).
 3. Launch **Premiere Pro** — import any file onto the timeline or press **`Ctrl+M`** and select any **`ARZ - ...`** format!
 
 ---

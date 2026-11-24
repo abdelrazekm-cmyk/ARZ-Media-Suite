@@ -125,7 +125,6 @@ void AERSession::triggerLookahead(int64_t anchorFrame, int width, int height, Pi
 }
 
 void AERSession::lookaheadLoop() {
-    constexpr int kMaxLookaheadWindow = 6;
     while (true) {
         LookaheadTarget target{};
         {
@@ -138,7 +137,14 @@ void AERSession::lookaheadLoop() {
 
         if (!videoDecoder_) continue;
 
-        for (int i = 0; i < kMaxLookaheadWindow; ++i) {
+        const VramStatus vst = GpuDeviceManager::instance().queryVramStatus(LRUFrameCache::instance().totalVramBytes());
+        const AdaptiveHardwareBudgets budgets = AERConfig::instance()
+                                                    .computeAdaptiveBudgets(vst.budgetBytes, vst.currentUsageBytes, LRUFrameCache::instance().totalVramBytes());
+        const size_t singleFrameBytes = std::max<size_t>(1, estimateTightFrameBytes(target.width, target.height, target.format));
+        const int maxSafeByCacheCapacity = std::max<int>(2, static_cast<int>(budgets.l1VramCacheBytes / singleFrameBytes) - 3);
+        const int dynamicWindow = std::min(budgets.lookaheadFrames, maxSafeByCacheCapacity);
+
+        for (int i = 0; i < dynamicWindow; ++i) {
             {
                 std::lock_guard<std::mutex> lock(lookaheadMutex_);
                 if (lookaheadStop_ || lookaheadTarget_.active) {
@@ -153,7 +159,7 @@ void AERSession::lookaheadLoop() {
                     target.width, target.height, target.format, target.generation, decodedNum)) {
                 break;
             }
-            if (decodedNum < 0 || decodedNum >= target.anchorFrame + kMaxLookaheadWindow) {
+            if (decodedNum < 0 || decodedNum >= target.anchorFrame + dynamicWindow) {
                 break;
             }
         }

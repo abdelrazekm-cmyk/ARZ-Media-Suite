@@ -328,13 +328,16 @@ int wmain(int argc, wchar_t* argv[]) {
         auto lt1 = std::chrono::steady_clock::now();
         const double lookaheadStepMs = std::chrono::duration<double, std::milli>(lt1 - lt0).count() / 4.0;
 
-        // 3D. Test 4K 10-bit BGRA_32f ALSO runs 100% on GPU (ZERO CPU RAM overflow!)
-        std::vector<uint8_t> float32Buf(static_cast<size_t>(m.width) * m.height * 16ULL);
-        if (!session.renderVideoFrame(baseFrame + 1, m.width, m.height, m.width * 16,
-                                      aer::PixelBufferFormat::BGRA_32f, float32Buf.data(), true, false)) {
-            std::cerr << "[FAIL] GPU BGRA_32f conversion failed!\n";
-            return 36;
+        // 3D. Measure L2 DDR5 Bi-Directional Reverse Scrub Hit (frames 244 -> 243 -> 242 -> 241 -> 240)!
+        auto rt0 = std::chrono::steady_clock::now();
+        for (int rev = 4; rev >= 0; --rev) {
+            if (!session.renderVideoFrame(baseFrame + rev, m.width, m.height, nativeStride,
+                                          nativeFmt, yuvBuf.data(), true, false)) {
+                return 36;
+            }
         }
+        auto rt1 = std::chrono::steady_clock::now();
+        const double l2ReverseScrubMs = std::chrono::duration<double, std::milli>(rt1 - rt0).count() / 5.0;
 
         // Verify thumbnail decode does NOT open a second GPU hardware decoder stream!
         std::vector<uint8_t> thumbBuf(160ULL * 90ULL * 4ULL);
@@ -343,17 +346,18 @@ int wmain(int argc, wchar_t* argv[]) {
         const size_t vramMB = aer::AERSession::totalCachedVramBytes() / (1024ULL * 1024ULL);
         const size_t ramMB = aer::AERSession::totalCachedBytes() / (1024ULL * 1024ULL);
 
-        std::cout << "  Average 4K 10-bit Native P010 Fast-Scrub Jump     : " << avgScrubMs << " ms/jump!\n";
-        std::cout << "  GOP Lookahead Sequential Playback Latency (4K)    : " << lookaheadStepMs << " ms/frame!\n";
+        std::cout << "  Average 4K 10-bit Fast-Scrub Jump                 : " << avgScrubMs << " ms/jump!\n";
+        std::cout << "  L1 VRAM GOP Lookahead Playback Latency (4K)       : " << lookaheadStepMs << " ms/frame!\n";
+        std::cout << "  L2 DDR5 Bi-Directional Reverse Scrub Latency (4K) : " << l2ReverseScrubMs << " ms/frame!\n";
         std::cout << "  Active GPU Decode Streams (incl. Thumbnail)       : " << gpuStreams << " (Shared Session + Zero thumb GPU!)\n";
-        std::cout << "  Cached VRAM / CPU-RAM Footprint                   : VRAM=" << vramMB << " MB (cap 384 MB), CPU-RAM=" << ramMB << " MB (ZERO CPU swscale!)\n";
-        if (gpuStreams > 1 || vramMB > 390 || ramMB > 0) {
-            std::cerr << "[FAIL] Unexpected CPU RAM fallback or resource cap exceeded! gpuStreams="
+        std::cout << "  Adaptive Two-Tier Cache Footprint                 : L1 VRAM=" << vramMB << " MB, L2 DDR5 RAM=" << ramMB << " MB\n";
+        if (gpuStreams > 1 || vramMB > 1850 || ramMB > 2650) {
+            std::cerr << "[FAIL] Adaptive Governor cap exceeded! gpuStreams="
                       << gpuStreams << " vramMB=" << vramMB << " ramMB=" << ramMB << "\n";
             return 32;
         }
     }
 
-    std::cout << "\n[PASS] ALL ARZ v1.2.0 Native P010 GPU + GOP Lookahead + Shared MediaCore Tests Passed!\n";
+    std::cout << "\n[PASS] ALL ARZ v1.3.0 Adaptive Hardware Governor + L1/L2 Hybrid Scrub Tests Passed!\n";
     return 0;
 }

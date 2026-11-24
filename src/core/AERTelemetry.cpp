@@ -92,10 +92,17 @@ void AERTelemetry::flushJsonLocked(uint32_t activeGpuStreams) {
     const auto& gpuMgr = GpuDeviceManager::instance();
     const size_t aerVramBytes = LRUFrameCache::instance().totalVramBytes();
     const VramStatus vst = gpuMgr.queryVramStatus(aerVramBytes);
+    const AdaptiveHardwareBudgets adaptive =
+        cfg.computeAdaptiveBudgets(vst.budgetBytes, vst.currentUsageBytes, aerVramBytes);
 
     out << "{\n"
         << "  \"plugin\": \"ARZ\",\n"
-        << "  \"version\": \"1.2.1\",\n"
+        << "  \"version\": \"1.3.0\",\n"
+        << "  \"governor_profile\": \"" << jsonEscape(adaptive.tierName) << "\",\n"
+        << "  \"auto_l1_vram_cap_mb\": " << (adaptive.l1VramCacheBytes / (1024ULL * 1024ULL)) << ",\n"
+        << "  \"auto_l2_ram_cap_mb\": " << (adaptive.l2RamCacheBytes / (1024ULL * 1024ULL)) << ",\n"
+        << "  \"auto_lookahead_frames\": " << adaptive.lookaheadFrames << ",\n"
+        << "  \"auto_aux_cpu_threads\": " << adaptive.maxAuxCpuThreads << ",\n"
         << "  \"process_id\": " << currentPid() << ",\n"
         << "  \"updated_at_ms\": " << nowMs << ",\n"
         << "  \"gpu_adapter\": \"" << jsonEscape(gpuMgr.adapterName()) << "\",\n"

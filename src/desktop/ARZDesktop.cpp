@@ -110,14 +110,13 @@ void loadConfigState() {
 bool saveConfigState() {
     std::ofstream out(getConfigPath(), std::ios::trunc);
     if (!out.is_open()) return false;
-    out << "# ARZ Media Suite v1.2.0 Configuration\n"
+    out << "# ARZ Media Suite v1.3.0 Adaptive Governor Configuration\n"
         << "enableHardwareDecode=" << (g_state.hwDecode ? "true" : "false") << "\n"
         << "enableGpuColorConvert=" << (g_state.gpuColor ? "true" : "false") << "\n"
         << "selectiveOverride=" << (g_state.selectiveOverride ? "true" : "false") << "\n"
         << "enableFrameCache=" << (g_state.frameCache ? "true" : "false") << "\n"
-        << "maxPercentVramBudget=78\n"
-        << "maxVramCacheMB=384\n"
-        << "maxRamCacheMB=512\n";
+        << "enableAdaptiveGovernor=true\n"
+        << "maxPercentVramBudget=78\n";
     return true;
 }
 
@@ -214,12 +213,12 @@ std::wstring readLatestTelemetryText() {
 
 void refreshLanguageLabels(HWND hwnd) {
     SetWindowTextW(hwnd, g_isArabic
-                             ? L"ARZ Media Suite v1.0.0 — مركز التحكم ومراقبة كارت الشاشة"
-                             : L"ARZ Media Suite v1.0.0 — Control Center & RTX GPU Monitor");
+                             ? L"ARZ Media Suite v1.3.0 — مركز التحكم والموازن الذكي للموارد"
+                             : L"ARZ Media Suite v1.3.0 — Control Center & Adaptive Resource Governor");
     SetWindowTextW(g_btnLang, g_isArabic ? L"English (LTR)" : L"العربية (RTL)");
     SetWindowTextW(g_lblSub, g_isArabic
-                                 ? L"حزمة الاستيراد والتصدير الاحترافية (59 صيغة | RTX NVENC AV1 | كاش VRAM -> RAM)"
-                                 : L"Native Premiere Pro 27 Importer & Exporter (59 Formats | RTX NVENC AV1 | VRAM -> RAM Cache)");
+                                 ? L"توازن تلقائي ذكي حسب جهازك (GPU + L1 VRAM + L2 DDR5 RAM + CPU)"
+                                 : L"Auto-Customized Resource Balance (GPU + L1 VRAM + L2 RAM + CPU)");
     SetWindowTextW(g_chkHwDecode, g_isArabic
                                       ? L"تفعيل فك التشفير العتادي على كارت الشاشة (NVIDIA D3D11VA / NVDEC)"
                                       : L"Enable GPU Hardware Decoding (NVIDIA D3D11VA / NVDEC)");
@@ -230,8 +229,8 @@ void refreshLanguageLabels(HWND hwnd) {
                                       ? L"أولوية ARZ التلقائية لملفات MKV / WebM / AV1 / ProRes / DXV"
                                       : L"High-Priority ARZ Override for MKV / WebM / AV1 / ProRes / DXV");
     SetWindowTextW(g_chkCache, g_isArabic
-                                   ? L"تفعيل الكاش المزدوج الذكي (VRAM حتى 82% ثم الترحيل للـ RAM)"
-                                   : L"Enable Two-Tier Smart Frame Cache (82% VRAM -> System RAM Spillover)");
+                                   ? L"تفعيل الموازن الهجين التلقائي (L1 VRAM + L2 RAM حسب موارد جهازك)"
+                                   : L"Enable Adaptive Two-Tier Hybrid Cache (Auto L1 VRAM + L2 RAM per PC)");
     SetWindowTextW(g_btnSave, g_isArabic ? L"حفظ إعدادات ARZ" : L"Save ARZ Settings");
     SetWindowTextW(g_btnClearCache, g_isArabic ? L"مسح كاش إضافات بريمير" : L"Clear Premiere PluginCache");
     SetWindowTextW(g_lblTeleHeader, g_isArabic
