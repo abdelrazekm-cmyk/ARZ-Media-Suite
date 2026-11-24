@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -55,11 +56,21 @@ public:
         int dstRowBytes,
         bool flipVertical = false);
 
+    void recycleVramTexture(Microsoft::WRL::ComPtr<ID3D11Texture2D> tex, int width, int height);
+    void trimIdleResources();
+
 private:
     GpuDeviceManager() = default;
     ~GpuDeviceManager();
 
     bool ensureStagingTextureLocked(int width, int height);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> acquireOutputTextureLocked(int width, int height);
+
+    struct PooledVramTex {
+        int width = 0;
+        int height = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> tex;
+    };
 
     mutable std::mutex mutex_;
     bool initialized_ = false;
@@ -83,6 +94,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTex_;
     int stagingW_ = 0;
     int stagingH_ = 0;
+    std::vector<PooledVramTex> vramTexPool_;
 };
 
 } // namespace aer

@@ -16,10 +16,11 @@ struct AERConfig {
     bool enableJsonTelemetry = true;
     bool selectiveOverride = true;
     bool forceOverrideAll = false;
-    // Dynamic VRAM-first -> RAM spillover ratios (no fixed stream count limit!)
-    uint32_t maxPercentVramBudget = 82;
-    uint32_t maxPercentAvailableRam = 55;
-    uint32_t maxRamCacheMB = 4096;
+    // Lean VRAM & RAM cache budgets (Premiere caches rendered PPix frames independently)
+    uint32_t maxPercentVramBudget = 78;
+    uint32_t maxVramCacheMB = 384;
+    uint32_t maxPercentAvailableRam = 15;
+    uint32_t maxRamCacheMB = 512;
     std::string preferredGpuBackend = "auto";
     std::unordered_set<std::string> userOverrideExtensions;
 

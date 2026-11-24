@@ -77,6 +77,7 @@ public:
 
 private:
     VideoDecoder* ensureThumbnailDecoder();
+    AudioDecoder* ensureAudioDecoder();
 
     static std::atomic<uint64_t> s_nextId_;
     uint64_t sessionId_ = 0;
@@ -85,6 +86,7 @@ private:
     std::unique_ptr<VideoDecoder> videoDecoder_;
     std::mutex thumbInitMutex_;
     std::unique_ptr<VideoDecoder> thumbDecoder_;
+    std::mutex audioInitMutex_;
     std::unique_ptr<AudioDecoder> audioDecoder_;
 };
 

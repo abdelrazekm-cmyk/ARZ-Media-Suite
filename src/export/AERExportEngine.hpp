@@ -1,7 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -92,6 +97,7 @@ struct ExportJobConfig {
     int audioSampleRate = 48000;
     int audioChannels = 2;        // 1, 2, or 6 (5.1)
     int audioBitrateKbps = 192;
+    bool enableAsyncPipeline = true;
 };
 
 class AER_API AERExportEngine {
@@ -121,31 +127,52 @@ public:
 private:
     bool initVideoStream();
     bool initAudioStream();
-    bool drainPackets(AVCodecContext* encCtx, AVStream* stream);
+    bool drainPackets(AVCodecContext* encCtx, AVStream* stream, AVPacket* pkt);
+    bool encodeTopDownBgraFrameInternal(const uint8_t* topDownBgra, int tightRowBytes);
+    void startAsyncVideoWorker();
+    bool stopAsyncVideoWorker(bool flushPending);
+    void videoWorkerLoop();
     bool encodeNextAudioFrameFromFifo(bool flushRemainder);
 
     ExportJobConfig cfg_{};
     bool opened_ = false;
     bool headerWritten_ = false;
+    bool directBgr0Input_ = false;
     std::string lastError_;
     std::string activeVidEncName_ = "none";
     std::string activeAudEncName_ = "none";
 
+    std::mutex muxMutex_;
     AVFormatContext* fmtCtx_ = nullptr;
     AVStream* vidStream_ = nullptr;
     AVCodecContext* vidEncCtx_ = nullptr;
     AVFrame* vidFrame_ = nullptr;
+    AVPacket* vidPkt_ = nullptr;
     SwsContext* swsCtx_ = nullptr;
     int64_t nextVideoPts_ = 0;
+
+    static constexpr size_t kAsyncRingSlots = 4;
+    std::vector<std::vector<uint8_t>> videoSlots_;
+    std::deque<size_t> freeVideoSlots_;
+    std::deque<size_t> pendingVideoSlots_;
+    std::mutex workerMutex_;
+    std::condition_variable workerCv_;
+    std::condition_variable slotsCv_;
+    std::thread videoWorkerThread_;
+    bool workerRunning_ = false;
+    bool workerStopRequested_ = false;
+    bool workerAbortNow_ = false;
+    std::atomic<bool> workerFailed_{false};
 
     AVStream* audStream_ = nullptr;
     AVCodecContext* audEncCtx_ = nullptr;
     AVFrame* audFrame_ = nullptr;
     SwrContext* swrCtx_ = nullptr;
-    AVPacket* pkt_ = nullptr;
+    AVPacket* audPkt_ = nullptr;
     int64_t nextAudioPts_ = 0;
     int effectiveAudRate_ = 48000;
     std::vector<std::vector<float>> audioFifo_;
+    size_t audioFifoReadPos_ = 0;
     size_t audioFifoSamples_ = 0;
 };
 

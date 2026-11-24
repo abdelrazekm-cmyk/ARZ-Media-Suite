@@ -1,6 +1,7 @@
 #include "core/AERSession.hpp"
 #include "core/AERConfig.hpp"
 #include "core/AERTelemetry.hpp"
+#include "media/GpuDeviceManager.hpp"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -69,10 +70,10 @@ bool AERSession::open(const std::wstring& filePath, bool highPriorityMode) {
         avformat_close_input(&keptVideoCtx);
     }
 
-    if (meta_.hasAudio) {
-        audioDecoder_ = std::make_unique<AudioDecoder>(filePath_);
-        if (!audioDecoder_->open(meta_)) {
-            audioDecoder_.reset();
+    // Lazy AudioDecoder initialization: for video+audio containers, defer opening a second
+    // AVFormatContext/codec until Premiere actually requests audio samples or waveform peaks!
+    if (!meta_.hasVideo && meta_.hasAudio) {
+        if (!ensureAudioDecoder()) {
             meta_.hasAudio = false;
         }
     }
@@ -82,6 +83,20 @@ bool AERSession::open(const std::wstring& filePath, bool highPriorityMode) {
         return false;
     }
     return true;
+}
+
+AudioDecoder* AERSession::ensureAudioDecoder() {
+    if (!meta_.hasAudio) return nullptr;
+    std::lock_guard<std::mutex> lock(audioInitMutex_);
+    if (audioDecoder_) {
+        return audioDecoder_.get();
+    }
+    auto ad = std::make_unique<AudioDecoder>(filePath_);
+    if (!ad->open(meta_)) {
+        return nullptr;
+    }
+    audioDecoder_ = std::move(ad);
+    return audioDecoder_.get();
 }
 
 VideoDecoder* AERSession::ensureThumbnailDecoder() {
@@ -96,7 +111,7 @@ VideoDecoder* AERSession::ensureThumbnailDecoder() {
         return videoDecoder_.get();
     }
     auto td = std::make_unique<VideoDecoder>(sessionId_ + 1000000ULL, filePath_);
-    if (!td->open(thumbCtx, thumbMeta)) {
+    if (!td->open(thumbCtx, thumbMeta, /*lowResourceThumbnailMode=*/true)) {
         return videoDecoder_.get();
     }
     thumbDecoder_ = std::move(td);
@@ -107,27 +122,51 @@ void AERSession::quiet() {
     if (videoDecoder_) {
         videoDecoder_->quietHardwareSession();
     }
-    if (thumbDecoder_) {
-        thumbDecoder_->close();
-        thumbDecoder_.reset();
+    {
+        std::lock_guard<std::mutex> lock(thumbInitMutex_);
+        if (thumbDecoder_) {
+            thumbDecoder_->close();
+            thumbDecoder_.reset();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(audioInitMutex_);
+        if (audioDecoder_ && meta_.hasVideo) {
+            audioDecoder_->close();
+            audioDecoder_.reset();
+        }
     }
     LRUFrameCache::instance().evictSession(sessionId_);
+    LRUFrameCache::instance().evictSession(sessionId_ + 1000000ULL);
+    if (VideoDecoder::activeHardwareStreamCount() == 0) {
+        GpuDeviceManager::instance().trimIdleResources();
+    }
 }
 
 void AERSession::close() {
-    if (thumbDecoder_) {
-        thumbDecoder_->close();
-        thumbDecoder_.reset();
+    {
+        std::lock_guard<std::mutex> lock(thumbInitMutex_);
+        if (thumbDecoder_) {
+            thumbDecoder_->close();
+            thumbDecoder_.reset();
+        }
     }
     if (videoDecoder_) {
         videoDecoder_->close();
         videoDecoder_.reset();
     }
-    if (audioDecoder_) {
-        audioDecoder_->close();
-        audioDecoder_.reset();
+    {
+        std::lock_guard<std::mutex> lock(audioInitMutex_);
+        if (audioDecoder_) {
+            audioDecoder_->close();
+            audioDecoder_.reset();
+        }
     }
     LRUFrameCache::instance().evictSession(sessionId_);
+    LRUFrameCache::instance().evictSession(sessionId_ + 1000000ULL);
+    if (VideoDecoder::activeHardwareStreamCount() == 0) {
+        GpuDeviceManager::instance().trimIdleResources();
+    }
     meta_ = MediaMetadata{};
 }
 
@@ -216,10 +255,11 @@ bool AERSession::renderVideoFrame(int64_t frameNumber,
 bool AERSession::renderAudioSamples(int64_t startSampleFrame,
                                     uint32_t sampleFrameCount,
                                     float* const* outChannelBuffers) {
-    if (!audioDecoder_ || !meta_.hasAudio) {
+    AudioDecoder* ad = ensureAudioDecoder();
+    if (!ad) {
         return false;
     }
-    return audioDecoder_->readPlanarFloatSamples(startSampleFrame, sampleFrameCount, outChannelBuffers);
+    return ad->readPlanarFloatSamples(startSampleFrame, sampleFrameCount, outChannelBuffers);
 }
 
 bool AERSession::renderAudioPeaks(int64_t startSampleFrame,
@@ -227,10 +267,11 @@ bool AERSession::renderAudioPeaks(int64_t startSampleFrame,
                                   int32_t numPeakFrames,
                                   float** outMinima,
                                   float** outMaxima) {
-    if (!audioDecoder_ || !meta_.hasAudio) {
+    AudioDecoder* ad = ensureAudioDecoder();
+    if (!ad) {
         return false;
     }
-    return audioDecoder_->computePeakAudio(startSampleFrame, peakSampleRate, numPeakFrames, outMinima, outMaxima);
+    return ad->computePeakAudio(startSampleFrame, peakSampleRate, numPeakFrames, outMinima, outMaxima);
 }
 
 } // namespace aer

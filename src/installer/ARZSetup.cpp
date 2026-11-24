@@ -31,12 +31,13 @@ constexpr int IDI_ARZ_ICON    = 101;
 constexpr int IDB_ARZ_BANNER  = 102;
 constexpr int IDR_PAYLOAD_ZIP = 201;
 
-constexpr int IDC_EDIT_PATH   = 3001;
-constexpr int IDC_BTN_INSTALL = 3002;
-constexpr int IDC_LBL_STATUS  = 3003;
+constexpr intptr_t IDC_EDIT_PATH   = 3001;
+constexpr intptr_t IDC_BTN_INSTALL = 3002;
+constexpr intptr_t IDC_EDIT_LOG    = 3003;
+constexpr intptr_t IDC_BTN_OPEN_CC = 3004;
 
 constexpr COLORREF kColBg    = RGB(11, 11, 13);
-constexpr COLORREF kColCard  = RGB(22, 22, 26);
+constexpr COLORREF kColCard  = RGB(20, 20, 25);
 constexpr COLORREF kColCream = RGB(243, 236, 224);
 constexpr COLORREF kColGold  = RGB(218, 155, 64);
 
@@ -44,10 +45,23 @@ HBRUSH  g_bgBrush = nullptr;
 HBRUSH  g_cardBrush = nullptr;
 HFONT   g_titleFont = nullptr;
 HFONT   g_uiFont = nullptr;
+HFONT   g_monoFont = nullptr;
 HBITMAP g_bannerBmp = nullptr;
 HWND    g_editPath = nullptr;
 HWND    g_btnInstall = nullptr;
-HWND    g_lblStatus = nullptr;
+HWND    g_btnOpenCc = nullptr;
+HWND    g_editLog = nullptr;
+std::wstring g_installedDir;
+
+void appendLogLine(const std::wstring& line) {
+    if (!g_editLog) return;
+    int len = GetWindowTextLengthW(g_editLog);
+    SendMessageW(g_editLog, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
+    std::wstring formatted = line + L"\r\n";
+    SendMessageW(g_editLog, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(formatted.c_str()));
+    SendMessageW(g_editLog, EM_SCROLLCARET, 0, 0);
+    UpdateWindow(g_editLog);
+}
 
 std::wstring detectDefaultInstallDir() {
     std::error_code ec;
@@ -82,7 +96,8 @@ bool isPremiereRunning() {
     return running;
 }
 
-void clearAdobePluginCaches() {
+int clearAdobePluginCaches() {
+    int clearedCount = 0;
     const wchar_t* roots[] = {
         L"Software\\Adobe\\Premiere Pro",
         L"Software\\Adobe\\Adobe Media Encoder"
@@ -110,16 +125,22 @@ void clearAdobePluginCaches() {
                             cacheKeys.emplace_back(subName);
                         }
                     }
-                    for (const auto& ck : cacheKeys) RegDeleteTreeW(hVer, ck.c_str());
+                    for (const auto& ck : cacheKeys) {
+                        if (RegDeleteTreeW(hVer, ck.c_str()) == ERROR_SUCCESS) {
+                            ++clearedCount;
+                        }
+                    }
                     RegCloseKey(hVer);
                 }
             }
             RegCloseKey(hRoot);
         }
     }
+    return clearedCount;
 }
 
-void createDesktopShortcut(const std::wstring& targetExe) {
+bool createDesktopShortcut(const std::wstring& targetExe) {
+    bool ok = false;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     wchar_t* desk = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desk)) && desk) {
@@ -133,34 +154,48 @@ void createDesktopShortcut(const std::wstring& targetExe) {
             psl->SetIconLocation(targetExe.c_str(), 0);
             IPersistFile* ppf = nullptr;
             if (SUCCEEDED(psl->QueryInterface(IID_PPV_ARGS(&ppf))) && ppf) {
-                ppf->Save(lnkPath.c_str(), TRUE);
+                ok = SUCCEEDED(ppf->Save(lnkPath.c_str(), TRUE));
                 ppf->Release();
             }
             psl->Release();
         }
     }
     CoUninitialize();
+    return ok;
 }
 
 bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::wstring& outErr) {
+    appendLogLine(L"[1/5] Checking embedded standalone ARZ v1.1.0 payload...");
     HRSRC hRes = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_PAYLOAD_ZIP), RT_RCDATA);
-    if (!hRes) { outErr = L"Embedded payload resource missing."; return false; }
+    if (!hRes) {
+        outErr = L"[ERROR] Embedded payload resource (#201) is missing from Setup.exe.";
+        appendLogLine(outErr);
+        return false;
+    }
     HGLOBAL hMem = LoadResource(hInst, hRes);
     const DWORD zipSize = SizeofResource(hInst, hRes);
     const void* zipData = LockResource(hMem);
-    if (!zipData || zipSize == 0) { outErr = L"Failed locking payload."; return false; }
+    if (!zipData || zipSize == 0) {
+        outErr = L"[ERROR] Failed locking embedded payload in memory.";
+        appendLogLine(outErr);
+        return false;
+    }
+    appendLogLine(L"      -> Payload verified (" + std::to_wstring(zipSize / (1024 * 1024)) + L" MB embedded).");
 
     std::error_code ec;
-    // Clean legacy AER sibling directory if migrating on Premiere Pro 2027
     std::filesystem::path dst(targetDir);
     std::filesystem::path legacyAer = dst.parent_path() / L"AER";
     if (std::filesystem::exists(legacyAer, ec)) {
+        appendLogLine(L"[2/5] Removing legacy AER plugin folder: " + legacyAer.wstring());
         std::filesystem::remove_all(legacyAer, ec);
+    } else {
+        appendLogLine(L"[2/5] Preparing clean target folder: " + dst.wstring());
     }
 
     std::filesystem::create_directories(dst, ec);
     if (ec) {
-        outErr = L"Administrator permission required to write to Program Files.";
+        outErr = L"[ERROR] Cannot write to target directory (Administrator privileges required): " + dst.wstring();
+        appendLogLine(outErr);
         return false;
     }
 
@@ -170,8 +205,14 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
     {
         std::ofstream out(tempZip, std::ios::binary | std::ios::trunc);
         out.write(static_cast<const char*>(zipData), zipSize);
+        if (!out.good()) {
+            outErr = L"[ERROR] Failed staging temporary archive in %TEMP%.";
+            appendLogLine(outErr);
+            return false;
+        }
     }
 
+    appendLogLine(L"[3/5] Extracting ARZ.prm, ARZ_HP.prm, ARZ_Exporter.prm, ARZCore.dll, ARZDesktop.exe & FFmpeg 9.1+ DLLs...");
     std::wstring cmd = L"tar.exe -xf \"" + tempZip.wstring() + L"\" -C \"" + dst.wstring() + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -187,13 +228,35 @@ bool performInstallation(HINSTANCE hInst, const std::wstring& targetDir, std::ws
     }
     std::filesystem::remove(tempZip, ec);
 
-    if (exitCode != 0 || !std::filesystem::exists(dst / L"ARZ.prm", ec)) {
-        outErr = L"Archive extraction failed (ensure Premiere Pro is closed).";
-        return false;
+    const wchar_t* requiredFiles[] = {
+        L"ARZ.prm", L"ARZ_HP.prm", L"ARZ_Exporter.prm", L"ARZCore.dll", L"ARZDesktop.exe"
+    };
+    for (const wchar_t* rf : requiredFiles) {
+        if (exitCode != 0 || !std::filesystem::exists(dst / rf, ec)) {
+            outErr = std::wstring(L"[ERROR] Failed extracting or verifying file: ") + rf +
+                     L" (make sure Premiere Pro & Media Encoder are completely closed).";
+            appendLogLine(outErr);
+            return false;
+        }
+    }
+    appendLogLine(L"      -> [OK] All ARZ plugins and standalone runtime DLLs verified on disk.");
+
+    appendLogLine(L"[4/5] Resetting Adobe Premiere Pro & Media Encoder PluginCache...");
+    const int cachesCleared = clearAdobePluginCaches();
+    appendLogLine(L"      -> [OK] Cleared " + std::to_wstring(cachesCleared) + L" Adobe PluginCache registry trees.");
+
+    appendLogLine(L"[5/5] Creating Desktop shortcut for ARZ Control Center...");
+    if (createDesktopShortcut((dst / L"ARZDesktop.exe").wstring())) {
+        appendLogLine(L"      -> [OK] Desktop shortcut 'ARZ Control Center' created.");
+    } else {
+        appendLogLine(L"      -> [WARN] Could not create Desktop shortcut (plugins are still installed).");
     }
 
-    clearAdobePluginCaches();
-    createDesktopShortcut((dst / L"ARZDesktop.exe").wstring());
+    appendLogLine(L"==================================================================");
+    appendLogLine(L"[SUCCESS] تم تثبيت حزمة ARZ Media Suite v1.1.0 بنجاح بدون أي أخطاء!");
+    appendLogLine(L"          يمكنك فتح Adobe Premiere Pro الآن مباشرة.");
+    appendLogLine(L"==================================================================");
+    g_installedDir = dst.wstring();
     return true;
 }
 
@@ -205,53 +268,69 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             HWND lblDir = CreateWindowExW(0, L"STATIC",
                 L"مسار تثبيت حزمة ARZ (Premiere Pro Target Folder):",
-                WS_CHILD | WS_VISIBLE, 28, 132, 580, 24, hwnd, nullptr, nullptr, nullptr);
+                WS_CHILD | WS_VISIBLE, 28, 128, 610, 22, hwnd, nullptr, nullptr, nullptr);
             g_editPath = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", detectDefaultInstallDir().c_str(),
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 28, 160, 584, 30,
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 28, 154, 614, 28,
                 hwnd, reinterpret_cast<HMENU>(IDC_EDIT_PATH), nullptr, nullptr);
             g_btnInstall = CreateWindowExW(0, L"BUTTON",
-                L"تثبيت حزمة ARZ v1.0 الآن  (Install ARZ Suite)",
-                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 28, 208, 584, 44,
+                L"تثبيت حزمة ARZ v1.1 الآن  (Install ARZ Suite)",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 28, 194, 396, 42,
                 hwnd, reinterpret_cast<HMENU>(IDC_BTN_INSTALL), nullptr, nullptr);
-            g_lblStatus = CreateWindowExW(0, L"STATIC",
-                L"حزمة مستقلة 100% — تشمل المستورد والمصدّر ومكتبات FFmpeg 9.1+ بدون أي متطلبات إضافية.",
-                WS_CHILD | WS_VISIBLE, 28, 266, 584, 40, hwnd, reinterpret_cast<HMENU>(IDC_LBL_STATUS), nullptr, nullptr);
+            g_btnOpenCc = CreateWindowExW(0, L"BUTTON",
+                L"فتح مركز التحكم (Control Center)",
+                WS_CHILD | WS_VISIBLE | WS_DISABLED, 434, 194, 208, 42,
+                hwnd, reinterpret_cast<HMENU>(IDC_BTN_OPEN_CC), nullptr, nullptr);
+
+            HWND lblLog = CreateWindowExW(0, L"STATIC",
+                L"سجل التثبيت المباشر (Live Installation & Verification Log):",
+                WS_CHILD | WS_VISIBLE, 28, 248, 610, 22, hwnd, nullptr, nullptr, nullptr);
+            g_editLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                28, 274, 614, 175,
+                hwnd, reinterpret_cast<HMENU>(IDC_EDIT_LOG), nullptr, nullptr);
 
             SendMessageW(lblDir, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
             SendMessageW(g_editPath, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
             SendMessageW(g_btnInstall, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
-            SendMessageW(g_lblStatus, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            SendMessageW(g_btnOpenCc, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            SendMessageW(lblLog, WM_SETFONT, reinterpret_cast<WPARAM>(g_uiFont), TRUE);
+            SendMessageW(g_editLog, WM_SETFONT, reinterpret_cast<WPARAM>(g_monoFont), TRUE);
+
+            appendLogLine(L"[READY] حزمة ARZ Media Suite v1.1.0 مستقلة 100% وجاهزة للتثبيت.");
+            appendLogLine(L"[INFO]  لا تحتاج لأي إضافات خارجية (شاملة المستورد + مصدّر RTX السريع + FFmpeg 9.1+).");
             return 0;
         }
 
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_BTN_INSTALL) {
+                SetWindowTextW(g_editLog, L"");
+                appendLogLine(L"[START] بدء عملية التثبيت وفحص البرامج المفتوحة...");
                 if (isPremiereRunning()) {
+                    appendLogLine(L"[ERROR] تم رصد تشغيل برنامج Adobe Premiere Pro أو Media Encoder حالياً!");
+                    appendLogLine(L"        برجاء إغلاقه تماماً ثم الضغط على تثبيت مرة أخرى.");
                     MessageBoxW(hwnd,
                         L"برجاء إغلاق برنامج Adobe Premiere Pro و Media Encoder أولاً قبل التثبيت.",
-                        L"ARZ Setup", MB_OK | MB_ICONWARNING);
+                        L"ARZ Setup — Close Premiere Pro", MB_OK | MB_ICONWARNING);
                     return 0;
                 }
                 wchar_t buf[MAX_PATH * 2]{};
                 GetWindowTextW(g_editPath, buf, MAX_PATH * 2);
-                SetWindowTextW(g_lblStatus, L"جاري استخراج وتثبيت ملفات ARZ ومسح PluginCache...");
-                UpdateWindow(hwnd);
                 EnableWindow(g_btnInstall, FALSE);
 
                 std::wstring err;
                 if (performInstallation(GetModuleHandleW(nullptr), buf, err)) {
-                    SetWindowTextW(g_lblStatus, L"تم تثبيت حزمة ARZ v1.0 بنجاح! يمكنك فتح Premiere Pro الآن.");
-                    if (MessageBoxW(hwnd,
-                            L"تم تثبيت حزمة ARZ v1.0 (المستورد + المصدّر + مركز التحكم) بنجاح!\nهل ترغب في فتح مركز تحكم ARZ الآن؟",
-                            L"ARZ Setup Complete", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
-                        std::wstring deskExe = std::wstring(buf) + L"\\ARZDesktop.exe";
-                        ShellExecuteW(nullptr, L"open", deskExe.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                    }
-                    DestroyWindow(hwnd);
-                } else {
+                    SetWindowTextW(g_btnInstall, L"تم التثبيت بنجاح ✓ (إعادة التثبيت)");
                     EnableWindow(g_btnInstall, TRUE);
-                    SetWindowTextW(g_lblStatus, err.c_str());
+                    EnableWindow(g_btnOpenCc, TRUE);
+                } else {
+                    appendLogLine(L"[FAILED] تعذر إكمال التثبيت — راجع سبب الخطأ بالأعلى.");
+                    EnableWindow(g_btnInstall, TRUE);
                     MessageBoxW(hwnd, err.c_str(), L"ARZ Setup Error", MB_OK | MB_ICONERROR);
+                }
+            } else if (LOWORD(wParam) == IDC_BTN_OPEN_CC) {
+                if (!g_installedDir.empty()) {
+                    std::wstring deskExe = g_installedDir + L"\\ARZDesktop.exe";
+                    ShellExecuteW(nullptr, L"open", deskExe.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                 }
             }
             return 0;
@@ -259,6 +338,11 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN: {
             HDC hdc = reinterpret_cast<HDC>(wParam);
+            if (reinterpret_cast<HWND>(lParam) == g_editLog) {
+                SetTextColor(hdc, kColCream);
+                SetBkColor(hdc, kColCard);
+                return reinterpret_cast<INT_PTR>(g_cardBrush);
+            }
             SetTextColor(hdc, kColCream);
             SetBkColor(hdc, kColBg);
             return reinterpret_cast<INT_PTR>(g_bgBrush);
@@ -291,15 +375,15 @@ LRESULT CALLBACK SetupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, kColGold);
             HGDIOBJ oldFont = SelectObject(hdc, g_titleFont);
-            TextOutW(hdc, 252, 26, L"ARZ SUITE INSTALLER  v1.0", 25);
+            TextOutW(hdc, 252, 24, L"ARZ SUITE INSTALLER  v1.1", 25);
             SelectObject(hdc, oldFont);
 
             SetTextColor(hdc, kColCream);
             oldFont = SelectObject(hdc, g_uiFont);
-            TextOutW(hdc, 252, 62, L"Premiere Pro 27 Native Importer + RTX Exporter", 46);
+            TextOutW(hdc, 252, 60, L"Premiere Pro 27 Native Importer + Turbo RTX Exporter", 52);
             SelectObject(hdc, oldFont);
 
-            RECT goldLine{20, 116, rc.right - 20, 118};
+            RECT goldLine{20, 114, rc.right - 20, 116};
             HBRUSH goldBr = CreateSolidBrush(kColGold);
             FillRect(hdc, &goldLine, goldBr);
             DeleteObject(goldBr);
@@ -324,7 +408,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
         return (hRes && SizeofResource(hInst, hRes) > 1000000) ? 0 : 2;
     }
 
-    // Auto-elevate to Administrator if launched without admin rights
     BOOL isAdmin = FALSE;
     PSID adminGroup = nullptr;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
@@ -344,8 +427,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     g_cardBrush = CreateSolidBrush(kColCard);
     g_titleFont = CreateFontW(25, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    g_uiFont    = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+    g_uiFont    = CreateFontW(17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    g_monoFont  = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
     g_bannerBmp = LoadBitmapW(hInst, MAKEINTRESOURCEW(IDB_ARZ_BANNER));
 
     WNDCLASSEXW wc{};
@@ -360,9 +445,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName, L"ARZ Media Suite v1.0.0 — Setup",
+        0, wc.lpszClassName, L"ARZ Media Suite v1.1.0 — Standalone Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 655, 360,
+        CW_USEDEFAULT, CW_USEDEFAULT, 680, 505,
         nullptr, nullptr, hInst, nullptr);
 
     ShowWindow(hwnd, nCmdShow);

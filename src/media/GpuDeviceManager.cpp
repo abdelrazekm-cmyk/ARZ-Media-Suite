@@ -17,6 +17,10 @@ GpuDeviceManager& GpuDeviceManager::instance() {
 }
 
 GpuDeviceManager::~GpuDeviceManager() {
+    for (auto& p : vramTexPool_) {
+        p.tex.Detach();
+    }
+    vramTexPool_.clear();
     adapter3_.Detach();
     vpEnum_.Detach();
     videoProcessor_.Detach();
@@ -172,18 +176,8 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::convertHwFrameToVramBg
     auto* hwDevCtx = reinterpret_cast<AVHWDeviceContext*>(ffHwDeviceRef_->data);
     auto* d3d11Ctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwDevCtx->hwctx);
 
-    D3D11_TEXTURE2D_DESC outDesc{};
-    outDesc.Width = static_cast<UINT>(dstWidth);
-    outDesc.Height = static_cast<UINT>(dstHeight);
-    outDesc.MipLevels = 1;
-    outDesc.ArraySize = 1;
-    outDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    outDesc.SampleDesc.Count = 1;
-    outDesc.Usage = D3D11_USAGE_DEFAULT;
-    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex;
-    if (FAILED(device_->CreateTexture2D(&outDesc, nullptr, outTex.GetAddressOf()))) {
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex = acquireOutputTextureLocked(dstWidth, dstHeight);
+    if (!outTex) {
         return nullptr;
     }
 
@@ -333,6 +327,50 @@ bool GpuDeviceManager::readbackVramTextureToCpu(
 
     context_->Unmap(stagingTex_.Get(), 0);
     return true;
+}
+
+Microsoft::WRL::ComPtr<ID3D11Texture2D> GpuDeviceManager::acquireOutputTextureLocked(int width, int height) {
+    for (auto it = vramTexPool_.begin(); it != vramTexPool_.end(); ++it) {
+        if (it->width == width && it->height == height && it->tex) {
+            auto reused = std::move(it->tex);
+            vramTexPool_.erase(it);
+            return reused;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC outDesc{};
+    outDesc.Width = static_cast<UINT>(width);
+    outDesc.Height = static_cast<UINT>(height);
+    outDesc.MipLevels = 1;
+    outDesc.ArraySize = 1;
+    outDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    outDesc.SampleDesc.Count = 1;
+    outDesc.Usage = D3D11_USAGE_DEFAULT;
+    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> outTex;
+    if (FAILED(device_->CreateTexture2D(&outDesc, nullptr, outTex.GetAddressOf()))) {
+        return nullptr;
+    }
+    return outTex;
+}
+
+void GpuDeviceManager::recycleVramTexture(Microsoft::WRL::ComPtr<ID3D11Texture2D> tex, int width, int height) {
+    if (!tex || width <= 0 || height <= 0) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    constexpr size_t kMaxPooledTextures = 6;
+    if (vramTexPool_.size() >= kMaxPooledTextures) {
+        vramTexPool_.erase(vramTexPool_.begin());
+    }
+    vramTexPool_.push_back(PooledVramTex{width, height, std::move(tex)});
+}
+
+void GpuDeviceManager::trimIdleResources() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    vramTexPool_.clear();
+    stagingTex_.Reset();
+    stagingW_ = 0;
+    stagingH_ = 0;
 }
 
 } // namespace aer

@@ -122,32 +122,36 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key, Microsoft::WRL::Com
     }
 
     const size_t texBytes = static_cast<size_t>(key.width) * static_cast<size_t>(key.height) * 4ULL;
-    const uint32_t maxVramPct = AERConfig::instance().maxPercentVramBudget;
+    const auto& cfg = AERConfig::instance();
+    const uint32_t maxVramPct = cfg.maxPercentVramBudget;
+    const uint64_t ownCacheCapBytes = static_cast<uint64_t>(std::max<uint32_t>(64, cfg.maxVramCacheMB)) * 1024ULL * 1024ULL;
 
-    std::vector<VramListEntry> spillToRam;
+    std::vector<CachedVramFrame> evicted;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto existing = vramIndex_.find(key);
         if (existing != vramIndex_.end()) {
             currentVramBytes_ -= existing->second->second.byteEstimate;
+            evicted.push_back(std::move(existing->second->second));
             vramLru_.erase(existing->second);
             vramIndex_.erase(existing);
         }
 
         const VramStatus vst = GpuDeviceManager::instance().queryVramStatus(currentVramBytes_);
-        if (vst.valid) {
-            const uint64_t ceiling = vst.effectiveCeilingBytes(maxVramPct);
-            uint64_t projectedUsage = vst.currentUsageBytes + texBytes;
-            while (projectedUsage > ceiling && !vramLru_.empty()) {
-                auto victim = std::move(vramLru_.back());
-                vramLru_.pop_back();
-                vramIndex_.erase(victim.first);
-                currentVramBytes_ -= victim.second.byteEstimate;
-                if (projectedUsage >= victim.second.byteEstimate) {
-                    projectedUsage -= victim.second.byteEstimate;
-                }
-                spillToRam.push_back(std::move(victim));
+        const uint64_t sysCeiling = vst.valid ? vst.effectiveCeilingBytes(maxVramPct) : UINT64_MAX;
+        uint64_t projectedSysUsage = vst.valid ? (vst.currentUsageBytes + texBytes) : 0;
+
+        while (!vramLru_.empty() &&
+               ((currentVramBytes_ + texBytes > ownCacheCapBytes) ||
+                (vst.valid && projectedSysUsage > sysCeiling))) {
+            auto victim = std::move(vramLru_.back());
+            vramLru_.pop_back();
+            vramIndex_.erase(victim.first);
+            currentVramBytes_ -= victim.second.byteEstimate;
+            if (projectedSysUsage >= victim.second.byteEstimate) {
+                projectedSysUsage -= victim.second.byteEstimate;
             }
+            evicted.push_back(std::move(victim.second));
         }
 
         CachedVramFrame entry;
@@ -162,22 +166,11 @@ void LRUFrameCache::putVramTexture(const FrameCacheKey& key, Microsoft::WRL::Com
         vramIndex_[key] = vramLru_.begin();
     }
 
-    for (auto& victim : spillToRam) {
-        auto ramFrame = std::make_shared<CachedVideoFrame>();
-        ramFrame->frameNumber = victim.second.frameNumber;
-        ramFrame->width = victim.second.width;
-        ramFrame->height = victim.second.height;
-        ramFrame->rowBytes = victim.second.width * 4;
-        ramFrame->format = PixelBufferFormat::BGRA_8u;
-        ramFrame->pixels.resize(static_cast<size_t>(ramFrame->rowBytes) * static_cast<size_t>(ramFrame->height));
-        if (GpuDeviceManager::instance().readbackVramTextureToCpu(
-                victim.second.texture.Get(),
-                ramFrame->width,
-                ramFrame->height,
-                ramFrame->pixels.data(),
-                ramFrame->rowBytes,
-                /*flipVertical=*/false)) {
-            putRamFrame(victim.first, std::move(ramFrame));
+    // Recycle evicted GPU surfaces directly back to D3D11 pool (ZERO PCIe readback or RAM bloat!)
+    auto& gpuMgr = GpuDeviceManager::instance();
+    for (auto& v : evicted) {
+        if (v.texture) {
+            gpuMgr.recycleVramTexture(std::move(v.texture), v.width, v.height);
         }
     }
 }

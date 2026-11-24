@@ -981,6 +981,52 @@ prMALError handleDoExport(exportStdParms* /*stdParms*/, exDoExportRec* exportRec
     const PrTime totalDuration = std::max<PrTime>(ticksPerFrame, exportRec->endTime - exportRec->startTime);
     prMALError result = malNoError;
 
+    // Set up audio renderer upfront so audio & video interleave continuously with ~0 MB muxer buffering!
+    bool audioActive = false;
+    csSDK_uint32 audioRenderID = 0;
+    PrTime ticksPerSample = 1;
+    PrAudioSample samplesRemaining = 0;
+    csSDK_int32 allocSamples = 4096;
+    float* chPtrs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+
+    if (cfg.enableAudio && inst->audioSuite && inst->memorySuite) {
+        inst->timeSuite->GetTicksPerAudioSample(static_cast<float>(cfg.audioSampleRate), &ticksPerSample);
+        const PrAudioChannelType chEnum = (cfg.audioChannels == 1)
+                                              ? kPrAudioChannelType_Mono
+                                              : ((cfg.audioChannels == 6) ? kPrAudioChannelType_51 : kPrAudioChannelType_Stereo);
+        if (inst->audioSuite->MakeAudioRenderer(
+                exID, exportRec->startTime, chEnum, kPrAudioSampleType_32BitFloat,
+                static_cast<float>(cfg.audioSampleRate), &audioRenderID) == suiteError_NoError) {
+            audioActive = true;
+            samplesRemaining = std::max<PrAudioSample>(0, totalDuration / std::max<PrTime>(1, ticksPerSample));
+            csSDK_int32 maxBlip = 4096;
+            inst->audioSuite->GetMaxBlip(audioRenderID, ticksPerFrame, &maxBlip);
+            allocSamples = std::clamp<csSDK_int32>(maxBlip, 2048, 65536);
+            for (int c = 0; c < cfg.audioChannels; ++c) {
+                chPtrs[c] = reinterpret_cast<float*>(inst->memorySuite->NewPtr(allocSamples * sizeof(float)));
+            }
+        }
+    }
+
+    auto pumpAudioSamples = [&](PrAudioSample maxSamplesToPump) -> bool {
+        if (!audioActive) return true;
+        PrAudioSample pumped = 0;
+        while (samplesRemaining > 0 && pumped < maxSamplesToPump) {
+            const PrAudioSample want = std::min<PrAudioSample>(samplesRemaining, maxSamplesToPump - pumped);
+            const csSDK_uint32 req = static_cast<csSDK_uint32>(std::min<PrAudioSample>(want, allocSamples));
+            if (req == 0) break;
+            if (inst->audioSuite->GetAudio(audioRenderID, req, chPtrs, kPrFalse) != suiteError_NoError) {
+                break;
+            }
+            if (!engine.writeAudioSamplesFloatPlanar(chPtrs, req)) {
+                return false;
+            }
+            samplesRemaining -= req;
+            pumped += req;
+        }
+        return true;
+    };
+
     if (cfg.enableVideo && inst->renderSuite && inst->ppixSuite) {
         csSDK_uint32 videoRenderID = 0;
         inst->renderSuite->MakeVideoRenderer(exID, &videoRenderID, ticksPerFrame);
@@ -1002,7 +1048,9 @@ prMALError handleDoExport(exportStdParms* /*stdParms*/, exDoExportRec* exportRec
                                 cfg.videoCodec == aer::ExportVideoCodec::APNG);
         rParms.inCompositeOnBlack = wantAlpha ? kPrFalse : kPrTrue;
 
-        const float videoProgressWeight = cfg.enableAudio ? 0.88f : 1.0f;
+        const PrAudioSample samplesPer12Frames = std::max<PrAudioSample>(
+            2048, (ticksPerFrame * 12) / std::max<PrTime>(1, ticksPerSample));
+        int frameCounter = 0;
 
         for (PrTime t = exportRec->startTime; t <= (exportRec->endTime - ticksPerFrame); t += ticksPerFrame) {
             SequenceRender_GetFrameReturnRec frameRet{};
@@ -1027,8 +1075,15 @@ prMALError handleDoExport(exportStdParms* /*stdParms*/, exDoExportRec* exportRec
                 }
             }
 
-            if (inst->progressSuite) {
-                const float pct = (static_cast<float>(t - exportRec->startTime) / static_cast<float>(totalDuration)) * videoProgressWeight;
+            if (audioActive && (++frameCounter % 12) == 0) {
+                if (!pumpAudioSamples(samplesPer12Frames)) {
+                    result = exportReturn_ErrIo;
+                    break;
+                }
+            }
+
+            if (inst->progressSuite && (frameCounter % 4) == 0) {
+                const float pct = (static_cast<float>(t - exportRec->startTime) / static_cast<float>(totalDuration)) * 0.98f;
                 const prSuiteError pRes = inst->progressSuite->UpdateProgressPercent(exID, pct);
                 if (pRes == suiteError_ExporterSuspended) {
                     inst->progressSuite->WaitForResume(exID);
@@ -1041,44 +1096,17 @@ prMALError handleDoExport(exportStdParms* /*stdParms*/, exDoExportRec* exportRec
         inst->renderSuite->ReleaseVideoRenderer(exID, videoRenderID);
     }
 
-    if (result == malNoError && cfg.enableAudio && inst->audioSuite && inst->memorySuite) {
-        PrTime ticksPerSample = 1;
-        inst->timeSuite->GetTicksPerAudioSample(static_cast<float>(cfg.audioSampleRate), &ticksPerSample);
-        csSDK_uint32 audioRenderID = 0;
-        const PrAudioChannelType chEnum = (cfg.audioChannels == 1)
-                                              ? kPrAudioChannelType_Mono
-                                              : ((cfg.audioChannels == 6) ? kPrAudioChannelType_51 : kPrAudioChannelType_Stereo);
-        if (inst->audioSuite->MakeAudioRenderer(
-                exID, exportRec->startTime, chEnum, kPrAudioSampleType_32BitFloat,
-                static_cast<float>(cfg.audioSampleRate), &audioRenderID) == suiteError_NoError) {
-            PrAudioSample samplesRemaining = std::max<PrAudioSample>(0, totalDuration / std::max<PrTime>(1, ticksPerSample));
-            csSDK_int32 maxBlip = 4096;
-            inst->audioSuite->GetMaxBlip(audioRenderID, ticksPerFrame, &maxBlip);
-            const csSDK_int32 allocSamples = std::clamp<csSDK_int32>(maxBlip, 1024, 65536);
-
-            float* chPtrs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-            for (int c = 0; c < cfg.audioChannels; ++c) {
-                chPtrs[c] = reinterpret_cast<float*>(inst->memorySuite->NewPtr(allocSamples * sizeof(float)));
-            }
-
-            while (samplesRemaining > 0 && result == malNoError) {
-                const csSDK_uint32 req = static_cast<csSDK_uint32>(
-                    std::min<PrAudioSample>(samplesRemaining, allocSamples));
-                if (inst->audioSuite->GetAudio(audioRenderID, req, chPtrs, kPrFalse) != suiteError_NoError) {
-                    break;
-                }
-                if (!engine.writeAudioSamplesFloatPlanar(chPtrs, req)) {
-                    result = exportReturn_ErrIo;
-                    break;
-                }
-                samplesRemaining -= req;
-            }
-
-            for (int c = 0; c < cfg.audioChannels; ++c) {
-                if (chPtrs[c]) inst->memorySuite->PrDisposePtr(reinterpret_cast<PrMemoryPtr>(chPtrs[c]));
-            }
-            inst->audioSuite->ReleaseAudioRenderer(exID, audioRenderID);
+    if (result == malNoError && audioActive && samplesRemaining > 0) {
+        if (!pumpAudioSamples(samplesRemaining)) {
+            result = exportReturn_ErrIo;
         }
+    }
+
+    if (audioActive) {
+        for (int c = 0; c < cfg.audioChannels; ++c) {
+            if (chPtrs[c]) inst->memorySuite->PrDisposePtr(reinterpret_cast<PrMemoryPtr>(chPtrs[c]));
+        }
+        inst->audioSuite->ReleaseAudioRenderer(exID, audioRenderID);
     }
 
     if (result == malNoError) {

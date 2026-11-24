@@ -43,11 +43,11 @@ const char* mapExtToFormatName(const std::string& ext) {
 
 std::vector<const char*> videoEncoderCandidates(ExportVideoCodec c) {
     switch (c) {
-        case ExportVideoCodec::AV1_NVENC:        return {"av1_nvenc", "libsvtav1", "libaom-av1"};
-        case ExportVideoCodec::AV1_SVT:          return {"libsvtav1", "libaom-av1", "av1_nvenc"};
-        case ExportVideoCodec::HEVC_NVENC:       return {"hevc_nvenc", "hevc_mf", "libkvazaar"};
-        case ExportVideoCodec::H264_NVENC:       return {"h264_nvenc", "libopenh264", "h264_mf"};
-        case ExportVideoCodec::H264_SW:          return {"libopenh264", "h264_nvenc"};
+        case ExportVideoCodec::AV1_NVENC:        return {"av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1"};
+        case ExportVideoCodec::AV1_SVT:          return {"libsvtav1", "libaom-av1", "av1_nvenc", "av1_qsv", "av1_amf"};
+        case ExportVideoCodec::HEVC_NVENC:       return {"hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf", "libkvazaar"};
+        case ExportVideoCodec::H264_NVENC:       return {"h264_nvenc", "h264_qsv", "h264_amf", "libopenh264", "h264_mf"};
+        case ExportVideoCodec::H264_SW:          return {"libopenh264", "h264_nvenc", "h264_qsv", "h264_amf"};
         case ExportVideoCodec::VP9:              return {"libvpx-vp9"};
         case ExportVideoCodec::PRORES_422_HQ:    return {"prores_ks", "prores_aw", "prores"};
         case ExportVideoCodec::PRORES_4444_ALPHA:return {"prores_ks", "prores"};
@@ -82,9 +82,15 @@ std::vector<const char*> audioEncoderCandidates(ExportAudioCodec c, const std::s
 }
 
 AVPixelFormat selectSupportedPixFmt(const AVCodec* codec,
+                                    const std::string& encName,
                                     ExportVideoCodec requestedCodec,
-                                    ExportChromaBitDepth depthMode) {
+                                    ExportChromaBitDepth depthMode,
+                                    ExportColorSpace colorSpace,
+                                    bool exactDimensions) {
     std::vector<AVPixelFormat> preferred;
+    const bool isHwEncoder = (encName.find("nvenc") != std::string::npos ||
+                              encName.find("amf") != std::string::npos);
+
     if (requestedCodec == ExportVideoCodec::PRORES_4444_ALPHA) {
         preferred = {AV_PIX_FMT_YUVA444P10LE, AV_PIX_FMT_YUV444P10LE};
     } else if (requestedCodec == ExportVideoCodec::PRORES_422_HQ ||
@@ -112,6 +118,9 @@ AVPixelFormat selectSupportedPixFmt(const AVCodec* codec,
         preferred = {AV_PIX_FMT_P010LE, AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P};
     } else if (depthMode == ExportChromaBitDepth::Bit10_422) {
         preferred = {AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_P010LE, AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV420P};
+    } else if (isHwEncoder && colorSpace == ExportColorSpace::Rec709_SDR && exactDimensions) {
+        // ZERO-SWSCALE FAST PATH: Feed BGRA/BGR0 straight into NVENC/AMF hardware ASIC!
+        preferred = {AV_PIX_FMT_BGR0, AV_PIX_FMT_BGRA, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P};
     } else {
         preferred = {AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P};
     }
@@ -189,11 +198,13 @@ AERExportEngine::~AERExportEngine() {
 }
 
 void AERExportEngine::abortAndClose() {
+    stopAsyncVideoWorker(/*flushPending=*/false);
     if (swsCtx_) { sws_freeContext(swsCtx_); swsCtx_ = nullptr; }
     if (swrCtx_) { swr_free(&swrCtx_); swrCtx_ = nullptr; }
     if (vidFrame_) av_frame_free(&vidFrame_);
     if (audFrame_) av_frame_free(&audFrame_);
-    if (pkt_) av_packet_free(&pkt_);
+    if (vidPkt_) av_packet_free(&vidPkt_);
+    if (audPkt_) av_packet_free(&audPkt_);
     if (vidEncCtx_) avcodec_free_context(&vidEncCtx_);
     if (audEncCtx_) avcodec_free_context(&audEncCtx_);
     if (fmtCtx_) {
@@ -205,8 +216,13 @@ void AERExportEngine::abortAndClose() {
     }
     vidStream_ = nullptr;
     audStream_ = nullptr;
+    videoSlots_.clear();
+    freeVideoSlots_.clear();
+    pendingVideoSlots_.clear();
     audioFifo_.clear();
+    audioFifoReadPos_ = 0;
     audioFifoSamples_ = 0;
+    directBgr0Input_ = false;
     opened_ = false;
     headerWritten_ = false;
 }
@@ -222,11 +238,18 @@ bool AERExportEngine::initVideoStream() {
         AVCodecContext* ctx = avcodec_alloc_context3(codec);
         if (!ctx) continue;
 
-        // Ensure even dimensions for 4:2:0 / 4:2:2 YUV codecs
-        const AVPixelFormat pixFmt = selectSupportedPixFmt(codec, cfg_.videoCodec, cfg_.bitDepthMode);
-        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(pixFmt);
+        const std::string nameStr(encName);
         int w = std::max(16, cfg_.width);
         int h = std::max(16, cfg_.height);
+        if (w & 1) w &= ~1;
+        if (h & 1) h &= ~1;
+        const bool exactDims = (w == cfg_.width && h == cfg_.height);
+
+        const AVPixelFormat pixFmt = selectSupportedPixFmt(
+            codec, nameStr, cfg_.videoCodec, cfg_.bitDepthMode, cfg_.colorSpace, exactDims);
+        const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(pixFmt);
+        w = std::max(16, cfg_.width);
+        h = std::max(16, cfg_.height);
         if (desc && desc->log2_chroma_w > 0 && (w & 1)) w &= ~1;
         if (desc && desc->log2_chroma_h > 0 && (h & 1)) h &= ~1;
 
@@ -261,16 +284,18 @@ bool AERExportEngine::initVideoStream() {
 
         const int threads = std::clamp(av_cpu_count(), 2, 16);
         ctx->thread_count = threads;
+        ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
         AVDictionary* opts = nullptr;
-        const std::string nameStr(encName);
         const int clampedCrf = std::clamp(cfg_.crfQuality, 0, 51);
         const int64_t targetBitsPerSec = static_cast<int64_t>(std::max(0.25, cfg_.targetBitrateMbps) * 1000000.0);
 
         if (nameStr.find("nvenc") != std::string::npos) {
             ctx->thread_count = 1;
+            ctx->thread_type = 0;
             const std::string pName = "p" + std::to_string(std::clamp(cfg_.speedPreset, 1, 7));
             av_dict_set(&opts, "preset", pName.c_str(), 0);
+            av_dict_set_int(&opts, "surfaces", 32, 0);
             if (cfg_.useCrfMode) {
                 av_dict_set(&opts, "rc", "vbr", 0);
                 av_dict_set_int(&opts, "cq", std::clamp(clampedCrf, 1, 51), 0);
@@ -280,7 +305,13 @@ bool AERExportEngine::initVideoStream() {
                 ctx->rc_max_rate = (targetBitsPerSec * 3) / 2;
                 ctx->rc_buffer_size = static_cast<int>(targetBitsPerSec * 2);
             }
+        } else if (nameStr.find("qsv") != std::string::npos || nameStr.find("amf") != std::string::npos) {
+            ctx->thread_count = 1;
+            ctx->thread_type = 0;
+            ctx->bit_rate = targetBitsPerSec;
         } else if (nameStr == "libsvtav1") {
+            ctx->thread_count = 0;
+            ctx->thread_type = 0;
             const int svtPreset = std::clamp(12 - cfg_.speedPreset * 2, 2, 10);
             av_dict_set_int(&opts, "preset", svtPreset, 0);
             if (cfg_.useCrfMode) {
@@ -291,6 +322,7 @@ bool AERExportEngine::initVideoStream() {
             }
         } else if (nameStr == "libvpx-vp9") {
             av_dict_set_int(&opts, "row-mt", 1, 0);
+            av_dict_set_int(&opts, "tile-columns", 2, 0);
             av_dict_set_int(&opts, "cpu-used", std::clamp(8 - cfg_.speedPreset, 1, 5), 0);
             if (cfg_.useCrfMode) {
                 av_dict_set_int(&opts, "crf", clampedCrf, 0);
@@ -299,26 +331,26 @@ bool AERExportEngine::initVideoStream() {
                 ctx->bit_rate = targetBitsPerSec;
             }
         } else if (nameStr == "prores_ks") {
+            ctx->thread_type = FF_THREAD_SLICE;
             if (cfg_.videoCodec == ExportVideoCodec::PRORES_4444_ALPHA) {
                 av_dict_set(&opts, "profile", "4444", 0);
             } else {
                 av_dict_set(&opts, "profile", "hq", 0);
             }
         } else if (nameStr == "dnxhd") {
+            ctx->thread_type = FF_THREAD_SLICE;
             av_dict_set(&opts, "profile",
                         (pixFmt == AV_PIX_FMT_YUV422P10LE) ? "dnxhr_hqx" : "dnxhr_hq", 0);
         } else if (nameStr == "ffv1") {
             ctx->level = 3;
+            ctx->thread_type = FF_THREAD_SLICE;
+            av_dict_set_int(&opts, "slices", std::clamp(threads, 4, 24), 0);
             av_dict_set_int(&opts, "slicecrc", 1, 0);
         } else if (nameStr == "libwebp_anim" || nameStr == "libwebp") {
             av_dict_set_int(&opts, "loop", 0, 0);
             av_dict_set_int(&opts, "quality", std::clamp(100 - clampedCrf * 2, 35, 100), 0);
         } else {
-            if (!cfg_.useCrfMode) {
-                ctx->bit_rate = targetBitsPerSec;
-            } else {
-                ctx->bit_rate = targetBitsPerSec;
-            }
+            ctx->bit_rate = targetBitsPerSec;
         }
 
         const int openRet = avcodec_open2(ctx, codec, &opts);
@@ -361,19 +393,35 @@ bool AERExportEngine::initVideoStream() {
         return false;
     }
 
-    swsCtx_ = sws_getContext(
-        cfg_.width, cfg_.height, AV_PIX_FMT_BGRA,
-        vidEncCtx_->width, vidEncCtx_->height, vidEncCtx_->pix_fmt,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!swsCtx_) {
-        lastError_ = "Failed creating BGRA -> encoder pixel format scaler.";
-        return false;
-    }
+    directBgr0Input_ = ((vidEncCtx_->pix_fmt == AV_PIX_FMT_BGR0 || vidEncCtx_->pix_fmt == AV_PIX_FMT_BGRA) &&
+                        vidEncCtx_->width == cfg_.width && vidEncCtx_->height == cfg_.height);
 
-    const int csCoeff = (cfg_.colorSpace == ExportColorSpace::Rec709_SDR) ? SWS_CS_ITU709 : SWS_CS_BT2020;
-    const int* coeffs = sws_getCoefficients(csCoeff);
-    const int dstRange = (vidEncCtx_->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
-    sws_setColorspaceDetails(swsCtx_, coeffs, 1, coeffs, dstRange, 0, 1 << 16, 1 << 16);
+    if (!directBgr0Input_) {
+        swsCtx_ = sws_alloc_context();
+        if (!swsCtx_) {
+            lastError_ = "Failed allocating swscale context.";
+            return false;
+        }
+        av_opt_set_int(swsCtx_, "srcw", cfg_.width, 0);
+        av_opt_set_int(swsCtx_, "srch", cfg_.height, 0);
+        av_opt_set_int(swsCtx_, "src_format", AV_PIX_FMT_BGRA, 0);
+        av_opt_set_int(swsCtx_, "dstw", vidEncCtx_->width, 0);
+        av_opt_set_int(swsCtx_, "dsth", vidEncCtx_->height, 0);
+        av_opt_set_int(swsCtx_, "dst_format", vidEncCtx_->pix_fmt, 0);
+        av_opt_set_int(swsCtx_, "sws_flags", SWS_BILINEAR, 0);
+        av_opt_set_int(swsCtx_, "threads", std::clamp(av_cpu_count() / 2, 2, 12), 0);
+        if (sws_init_context(swsCtx_, nullptr, nullptr) < 0) {
+            sws_freeContext(swsCtx_);
+            swsCtx_ = nullptr;
+            lastError_ = "Failed initializing multi-threaded BGRA -> encoder pixel format scaler.";
+            return false;
+        }
+
+        const int csCoeff = (cfg_.colorSpace == ExportColorSpace::Rec709_SDR) ? SWS_CS_ITU709 : SWS_CS_BT2020;
+        const int* coeffs = sws_getCoefficients(csCoeff);
+        const int dstRange = (vidEncCtx_->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+        sws_setColorspaceDetails(swsCtx_, coeffs, 1, coeffs, dstRange, 0, 1 << 16, 1 << 16);
+    }
     return true;
 }
 
@@ -453,6 +501,7 @@ bool AERExportEngine::initAudioStream() {
 
     audFrame_ = av_frame_alloc();
     audioFifo_.assign(static_cast<size_t>(std::clamp(cfg_.audioChannels, 1, 6)), {});
+    audioFifoReadPos_ = 0;
     audioFifoSamples_ = 0;
     return true;
 }
@@ -467,11 +516,9 @@ bool AERExportEngine::open(const ExportJobConfig& cfg) {
         return false;
     }
 
-    // Image-animation formats do not carry audio streams
     if (cfg_.containerExtension == "gif" || cfg_.containerExtension == "webp" || cfg_.containerExtension == "apng") {
         cfg_.enableAudio = false;
     }
-    // Pure audio containers do not carry video streams
     if (cfg_.containerExtension == "opus" || cfg_.containerExtension == "flac" ||
         cfg_.containerExtension == "wav" || cfg_.containerExtension == "mp3" ||
         cfg_.containerExtension == "aac" || cfg_.containerExtension == "aiff") {
@@ -490,8 +537,12 @@ bool AERExportEngine::open(const ExportJobConfig& cfg) {
         return false;
     }
 
-    pkt_ = av_packet_alloc();
-    if (!pkt_) return false;
+    vidPkt_ = av_packet_alloc();
+    audPkt_ = av_packet_alloc();
+    if (!vidPkt_ || !audPkt_) {
+        abortAndClose();
+        return false;
+    }
 
     if (cfg_.enableVideo && !initVideoStream()) {
         abortAndClose();
@@ -502,7 +553,7 @@ bool AERExportEngine::open(const ExportJobConfig& cfg) {
         return false;
     }
 
-    av_dict_set(&fmtCtx_->metadata, "encoder", "ARZ Exporter 1.0.0 (FFmpeg 9.1+)", 0);
+    av_dict_set(&fmtCtx_->metadata, "encoder", "ARZ Exporter 1.1.0 (FFmpeg 9.1+)", 0);
 
     if (!(fmtCtx_->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&fmtCtx_->pb, utf8Path.c_str(), AVIO_FLAG_WRITE) < 0) {
@@ -528,12 +579,86 @@ bool AERExportEngine::open(const ExportJobConfig& cfg) {
     nextAudioPts_ = 0;
     opened_ = true;
     headerWritten_ = true;
+
+    if (cfg_.enableVideo && cfg_.enableAsyncPipeline) {
+        startAsyncVideoWorker();
+    }
     return true;
 }
 
-bool AERExportEngine::drainPackets(AVCodecContext* encCtx, AVStream* stream) {
+void AERExportEngine::startAsyncVideoWorker() {
+    const size_t frameBytes = static_cast<size_t>(cfg_.width) * static_cast<size_t>(cfg_.height) * 4ULL;
+    videoSlots_.resize(kAsyncRingSlots);
+    freeVideoSlots_.clear();
+    pendingVideoSlots_.clear();
+    for (size_t i = 0; i < kAsyncRingSlots; ++i) {
+        videoSlots_[i].resize(frameBytes);
+        freeVideoSlots_.push_back(i);
+    }
+    workerStopRequested_ = false;
+    workerAbortNow_ = false;
+    workerFailed_.store(false, std::memory_order_release);
+    workerRunning_ = true;
+    videoWorkerThread_ = std::thread(&AERExportEngine::videoWorkerLoop, this);
+}
+
+bool AERExportEngine::stopAsyncVideoWorker(bool flushPending) {
+    if (!workerRunning_) {
+        return !workerFailed_.load(std::memory_order_acquire);
+    }
+    {
+        std::lock_guard<std::mutex> lock(workerMutex_);
+        workerStopRequested_ = true;
+        if (!flushPending) {
+            workerAbortNow_ = true;
+        }
+    }
+    workerCv_.notify_all();
+    slotsCv_.notify_all();
+    if (videoWorkerThread_.joinable()) {
+        videoWorkerThread_.join();
+    }
+    workerRunning_ = false;
+    return !workerFailed_.load(std::memory_order_acquire);
+}
+
+void AERExportEngine::videoWorkerLoop() {
+    const int tightRowBytes = cfg_.width * 4;
     while (true) {
-        const int ret = avcodec_receive_packet(encCtx, pkt_);
+        size_t slotIdx = 0;
+        {
+            std::unique_lock<std::mutex> lock(workerMutex_);
+            workerCv_.wait(lock, [this]() {
+                return workerAbortNow_ || !pendingVideoSlots_.empty() || workerStopRequested_;
+            });
+            if (workerAbortNow_) {
+                break;
+            }
+            if (pendingVideoSlots_.empty()) {
+                if (workerStopRequested_) break;
+                continue;
+            }
+            slotIdx = pendingVideoSlots_.front();
+            pendingVideoSlots_.pop_front();
+        }
+
+        const bool ok = !workerFailed_.load(std::memory_order_acquire) &&
+                        encodeTopDownBgraFrameInternal(videoSlots_[slotIdx].data(), tightRowBytes);
+        if (!ok) {
+            workerFailed_.store(true, std::memory_order_release);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(workerMutex_);
+            freeVideoSlots_.push_back(slotIdx);
+        }
+        slotsCv_.notify_one();
+    }
+}
+
+bool AERExportEngine::drainPackets(AVCodecContext* encCtx, AVStream* stream, AVPacket* pkt) {
+    while (true) {
+        const int ret = avcodec_receive_packet(encCtx, pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return true;
         }
@@ -541,10 +666,14 @@ bool AERExportEngine::drainPackets(AVCodecContext* encCtx, AVStream* stream) {
             lastError_ = "Encoder packet receive failed.";
             return false;
         }
-        av_packet_rescale_ts(pkt_, encCtx->time_base, stream->time_base);
-        pkt_->stream_index = stream->index;
-        const int wret = av_interleaved_write_frame(fmtCtx_, pkt_);
-        av_packet_unref(pkt_);
+        av_packet_rescale_ts(pkt, encCtx->time_base, stream->time_base);
+        pkt->stream_index = stream->index;
+        int wret = 0;
+        {
+            std::lock_guard<std::mutex> muxLock(muxMutex_);
+            wret = av_interleaved_write_frame(fmtCtx_, pkt);
+        }
+        av_packet_unref(pkt);
         if (wret < 0) {
             lastError_ = "Container packet write failed.";
             return false;
@@ -552,31 +681,34 @@ bool AERExportEngine::drainPackets(AVCodecContext* encCtx, AVStream* stream) {
     }
 }
 
-bool AERExportEngine::writeVideoFrameBgra8(const uint8_t* bgraPixels,
-                                           int rowBytes,
-                                           bool bottomUpInput) {
-    if (!opened_ || !vidEncCtx_ || !vidFrame_ || !swsCtx_ || !bgraPixels || rowBytes == 0) {
+bool AERExportEngine::encodeTopDownBgraFrameInternal(const uint8_t* topDownBgra, int tightRowBytes) {
+    if (!vidEncCtx_ || !vidFrame_ || !topDownBgra) {
         return false;
     }
     if (av_frame_make_writable(vidFrame_) < 0) {
         return false;
     }
 
-    // Zero-copy vertical flip when Premiere hands us bottom-up DIB BGRA_4444_8u!
-    const uint8_t* srcSlice[4] = {nullptr, nullptr, nullptr, nullptr};
-    int srcStride[4] = {0, 0, 0, 0};
-
-    if (bottomUpInput && rowBytes > 0) {
-        srcSlice[0] = bgraPixels + static_cast<size_t>(cfg_.height - 1) * static_cast<size_t>(rowBytes);
-        srcStride[0] = -rowBytes;
+    if (directBgr0Input_) {
+        const int dstStride = vidFrame_->linesize[0];
+        if (dstStride == tightRowBytes) {
+            std::memcpy(vidFrame_->data[0], topDownBgra,
+                        static_cast<size_t>(tightRowBytes) * static_cast<size_t>(cfg_.height));
+        } else {
+            for (int y = 0; y < cfg_.height; ++y) {
+                std::memcpy(vidFrame_->data[0] + static_cast<size_t>(y) * static_cast<size_t>(dstStride),
+                            topDownBgra + static_cast<size_t>(y) * static_cast<size_t>(tightRowBytes),
+                            static_cast<size_t>(tightRowBytes));
+            }
+        }
     } else {
-        srcSlice[0] = bgraPixels;
-        srcStride[0] = rowBytes;
-    }
-
-    if (sws_scale(swsCtx_, srcSlice, srcStride, 0, cfg_.height, vidFrame_->data, vidFrame_->linesize) <= 0) {
-        lastError_ = "sws_scale failed on export frame.";
-        return false;
+        if (!swsCtx_) return false;
+        const uint8_t* srcSlice[4] = {topDownBgra, nullptr, nullptr, nullptr};
+        int srcStride[4] = {tightRowBytes, 0, 0, 0};
+        if (sws_scale(swsCtx_, srcSlice, srcStride, 0, cfg_.height, vidFrame_->data, vidFrame_->linesize) <= 0) {
+            lastError_ = "sws_scale failed on export frame.";
+            return false;
+        }
     }
 
     vidFrame_->pts = nextVideoPts_++;
@@ -584,7 +716,88 @@ bool AERExportEngine::writeVideoFrameBgra8(const uint8_t* bgraPixels,
         lastError_ = "avcodec_send_frame (video) failed.";
         return false;
     }
-    return drainPackets(vidEncCtx_, vidStream_);
+    return drainPackets(vidEncCtx_, vidStream_, vidPkt_);
+}
+
+bool AERExportEngine::writeVideoFrameBgra8(const uint8_t* bgraPixels,
+                                           int rowBytes,
+                                           bool bottomUpInput) {
+    if (!opened_ || !vidEncCtx_ || !vidFrame_ || !bgraPixels || rowBytes == 0) {
+        return false;
+    }
+
+    const int tightRowBytes = cfg_.width * 4;
+
+    if (workerRunning_) {
+        if (workerFailed_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        size_t slotIdx = 0;
+        {
+            std::unique_lock<std::mutex> lock(workerMutex_);
+            slotsCv_.wait(lock, [this]() {
+                return !freeVideoSlots_.empty() || workerFailed_.load(std::memory_order_acquire) || workerAbortNow_;
+            });
+            if (workerFailed_.load(std::memory_order_acquire) || workerAbortNow_) {
+                return false;
+            }
+            slotIdx = freeVideoSlots_.front();
+            freeVideoSlots_.pop_front();
+        }
+
+        uint8_t* dst = videoSlots_[slotIdx].data();
+        if (!bottomUpInput && rowBytes == tightRowBytes) {
+            std::memcpy(dst, bgraPixels, static_cast<size_t>(tightRowBytes) * static_cast<size_t>(cfg_.height));
+        } else {
+            const ptrdiff_t signedSrcStride = static_cast<ptrdiff_t>(rowBytes);
+            for (int y = 0; y < cfg_.height; ++y) {
+                const int srcY = (bottomUpInput && rowBytes > 0) ? (cfg_.height - 1 - y) : y;
+                std::memcpy(dst + static_cast<size_t>(y) * static_cast<size_t>(tightRowBytes),
+                            bgraPixels + static_cast<ptrdiff_t>(srcY) * signedSrcStride,
+                            static_cast<size_t>(tightRowBytes));
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(workerMutex_);
+            pendingVideoSlots_.push_back(slotIdx);
+        }
+        workerCv_.notify_one();
+        return true;
+    }
+
+    // Synchronous fallback path (if enableAsyncPipeline == false)
+    if (directBgr0Input_) {
+        if (av_frame_make_writable(vidFrame_) < 0) return false;
+        const int dstStride = vidFrame_->linesize[0];
+        const ptrdiff_t signedSrcStride = static_cast<ptrdiff_t>(rowBytes);
+        for (int y = 0; y < cfg_.height; ++y) {
+            const int srcY = (bottomUpInput && rowBytes > 0) ? (cfg_.height - 1 - y) : y;
+            std::memcpy(vidFrame_->data[0] + static_cast<size_t>(y) * static_cast<size_t>(dstStride),
+                        bgraPixels + static_cast<ptrdiff_t>(srcY) * signedSrcStride,
+                        static_cast<size_t>(tightRowBytes));
+        }
+        vidFrame_->pts = nextVideoPts_++;
+        if (avcodec_send_frame(vidEncCtx_, vidFrame_) < 0) return false;
+        return drainPackets(vidEncCtx_, vidStream_, vidPkt_);
+    }
+
+    if (!swsCtx_ || av_frame_make_writable(vidFrame_) < 0) return false;
+    const uint8_t* srcSlice[4] = {nullptr, nullptr, nullptr, nullptr};
+    int srcStride[4] = {0, 0, 0, 0};
+    if (bottomUpInput && rowBytes > 0) {
+        srcSlice[0] = bgraPixels + static_cast<size_t>(cfg_.height - 1) * static_cast<size_t>(rowBytes);
+        srcStride[0] = -rowBytes;
+    } else {
+        srcSlice[0] = bgraPixels;
+        srcStride[0] = rowBytes;
+    }
+    if (sws_scale(swsCtx_, srcSlice, srcStride, 0, cfg_.height, vidFrame_->data, vidFrame_->linesize) <= 0) {
+        return false;
+    }
+    vidFrame_->pts = nextVideoPts_++;
+    if (avcodec_send_frame(vidEncCtx_, vidFrame_) < 0) return false;
+    return drainPackets(vidEncCtx_, vidStream_, vidPkt_);
 }
 
 bool AERExportEngine::encodeNextAudioFrameFromFifo(bool flushRemainder) {
@@ -595,7 +808,6 @@ bool AERExportEngine::encodeNextAudioFrameFromFifo(bool flushRemainder) {
                                  ? audEncCtx_->frame_size
                                  : 2048;
 
-    // Derive required input samples corresponding to encFrameSize output samples
     const int inRate = std::max(8000, cfg_.audioSampleRate);
     const size_t minInChunk = static_cast<size_t>(
         std::max<int64_t>(1, av_rescale_rnd(encFrameSize, inRate, audEncCtx_->sample_rate, AV_ROUND_UP)));
@@ -624,14 +836,13 @@ bool AERExportEngine::encodeNextAudioFrameFromFifo(bool flushRemainder) {
         if (av_frame_make_writable(audFrame_) < 0) {
             return false;
         }
-        // Pad frame with silence in case flushRemainder has fewer samples than fixed frame_size
         av_samples_set_silence(audFrame_->extended_data, 0, allocSamples,
                                audFrame_->ch_layout.nb_channels,
                                static_cast<AVSampleFormat>(audFrame_->format));
 
         std::vector<const uint8_t*> inPtrs(audioFifo_.size());
         for (size_t c = 0; c < audioFifo_.size(); ++c) {
-            inPtrs[c] = reinterpret_cast<const uint8_t*>(audioFifo_[c].data());
+            inPtrs[c] = reinterpret_cast<const uint8_t*>(audioFifo_[c].data() + audioFifoReadPos_);
         }
 
         const int converted = swr_convert(
@@ -641,10 +852,18 @@ bool AERExportEngine::encodeNextAudioFrameFromFifo(bool flushRemainder) {
             inPtrs.data(),
             static_cast<int>(takeIn));
 
-        for (auto& ch : audioFifo_) {
-            ch.erase(ch.begin(), ch.begin() + static_cast<std::ptrdiff_t>(takeIn));
-        }
+        audioFifoReadPos_ += takeIn;
         audioFifoSamples_ -= takeIn;
+
+        if (audioFifoSamples_ == 0) {
+            for (auto& ch : audioFifo_) ch.clear();
+            audioFifoReadPos_ = 0;
+        } else if (audioFifoReadPos_ >= 65536) {
+            for (auto& ch : audioFifo_) {
+                ch.erase(ch.begin(), ch.begin() + static_cast<std::ptrdiff_t>(audioFifoReadPos_));
+            }
+            audioFifoReadPos_ = 0;
+        }
 
         if (converted > 0) {
             if (varFrameSize || audEncCtx_->frame_size == 0) {
@@ -657,7 +876,7 @@ bool AERExportEngine::encodeNextAudioFrameFromFifo(bool flushRemainder) {
                 lastError_ = "avcodec_send_frame (audio) failed.";
                 return false;
             }
-            if (!drainPackets(audEncCtx_, audStream_)) {
+            if (!drainPackets(audEncCtx_, audStream_, audPkt_)) {
                 return false;
             }
         }
@@ -686,18 +905,19 @@ bool AERExportEngine::writeAudioSamplesFloatPlanar(const float* const* channelBu
 
 bool AERExportEngine::finalize() {
     if (!opened_ || !fmtCtx_) return false;
-    bool ok = true;
+    bool ok = stopAsyncVideoWorker(/*flushPending=*/true);
 
     if (audEncCtx_ && audStream_) {
         ok = encodeNextAudioFrameFromFifo(/*flushRemainder=*/true) && ok;
         avcodec_send_frame(audEncCtx_, nullptr);
-        ok = drainPackets(audEncCtx_, audStream_) && ok;
+        ok = drainPackets(audEncCtx_, audStream_, audPkt_) && ok;
     }
     if (vidEncCtx_ && vidStream_) {
         avcodec_send_frame(vidEncCtx_, nullptr);
-        ok = drainPackets(vidEncCtx_, vidStream_) && ok;
+        ok = drainPackets(vidEncCtx_, vidStream_, vidPkt_) && ok;
     }
     if (headerWritten_) {
+        std::lock_guard<std::mutex> muxLock(muxMutex_);
         if (av_write_trailer(fmtCtx_) < 0) {
             lastError_ = "av_write_trailer failed.";
             ok = false;

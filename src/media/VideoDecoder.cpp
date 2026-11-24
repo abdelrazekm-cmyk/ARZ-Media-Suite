@@ -106,6 +106,9 @@ bool VideoDecoder::hasDynamicVramHeadroomLocked() const {
 }
 
 void VideoDecoder::publishTelemetryLocked(const std::string& stateOverride) {
+    if (lowResourceThumbMode_) {
+        return;
+    }
     StreamGpuTelemetry t;
     t.sessionId = sessionId_;
     t.filePathUtf8 = DemuxEngine::wideToUtf8(filePath_);
@@ -164,7 +167,9 @@ void VideoDecoder::close() {
     eofReached_ = false;
     currentPts_ = AV_NOPTS_VALUE;
     currentFrameNumber_ = -1;
-    AERTelemetry::instance().removeSession(sessionId_, activeHardwareStreamCount());
+    if (!lowResourceThumbMode_) {
+        AERTelemetry::instance().removeSession(sessionId_, activeHardwareStreamCount());
+    }
 }
 
 int64_t VideoDecoder::nearestKeyframeFrame(int64_t frameNumber) const {
@@ -306,14 +311,22 @@ bool VideoDecoder::tryOpenCodecLocked(bool allowHardware) {
         codecCtx_->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
         usingHardware_ = true;
         fallbackReason_ = "ok";
+    } else if (lowResourceThumbMode_) {
+        codecCtx_->thread_count = 2;
+        codecCtx_->thread_type = FF_THREAD_SLICE;
+        if (std::string(decoder->name) == "libdav1d") {
+            av_dict_set_int(&opts, "threads", 2, 0);
+            av_dict_set_int(&opts, "tilethreads", 2, 0);
+            av_dict_set_int(&opts, "framethreads", 1, 0);
+        }
     } else if (AERConfig::instance().enableMultithreading) {
-        const int hwThreads = std::clamp(av_cpu_count(), 2, 16);
+        const int hwThreads = std::clamp(av_cpu_count(), 2, 12);
         codecCtx_->thread_count = hwThreads;
         codecCtx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         if (std::string(decoder->name) == "libdav1d") {
             av_dict_set_int(&opts, "threads", hwThreads, 0);
             av_dict_set_int(&opts, "tilethreads", std::clamp(hwThreads / 2, 1, 4), 0);
-            av_dict_set_int(&opts, "framethreads", std::clamp(hwThreads / 2, 1, 4), 0);
+            av_dict_set_int(&opts, "framethreads", std::clamp(hwThreads / 3, 1, 3), 0);
         }
     } else {
         codecCtx_->thread_count = 1;
@@ -352,8 +365,9 @@ bool VideoDecoder::fallbackToSoftwareMidStreamLocked(const std::string& reason) 
     return true;
 }
 
-bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta) {
+bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta, bool lowResourceThumbnailMode) {
     std::lock_guard<std::mutex> lock(mutex_);
+    lowResourceThumbMode_ = lowResourceThumbnailMode;
     fmtCtx_ = adoptedVideoCtx;
     meta_ = ioMeta;
     if (!fmtCtx_ || !meta_.hasVideo || meta_.videoStreamIndex < 0) {
@@ -379,7 +393,7 @@ bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta)
             meta_.vidTimebaseDen);
     }
 
-    if (!tryOpenCodecLocked(/*allowHardware=*/true)) {
+    if (!tryOpenCodecLocked(/*allowHardware=*/!lowResourceThumbMode_)) {
         if (!tryOpenCodecLocked(/*allowHardware=*/false)) {
             return false;
         }
@@ -438,8 +452,10 @@ bool VideoDecoder::open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta)
     seekIndex_.recordObservedFrame(0, firstPts, true);
     publishTelemetryLocked();
 
-    materializeAndCacheFrameLocked(probed, 0, meta_.width, meta_.height,
-                                   meta_.width * 4, PixelBufferFormat::BGRA_8u, nullptr, false);
+    if (!lowResourceThumbMode_) {
+        materializeAndCacheFrameLocked(probed, 0, meta_.width, meta_.height,
+                                       meta_.width * 4, PixelBufferFormat::BGRA_8u, nullptr, false);
+    }
 
     av_frame_free(&probed);
     return true;
@@ -545,6 +561,21 @@ bool VideoDecoder::materializeAndCacheFrameLocked(const AVFrame* decodedFrame,
     }
 
     const int tightRowBytes = outWidth * (outFormat == PixelBufferFormat::BGRA_32f ? 16 : 4);
+    if (lowResourceThumbMode_ && optionalCpuDst) {
+        std::vector<uint8_t> tmpThumb(static_cast<size_t>(tightRowBytes) * static_cast<size_t>(outHeight));
+        if (!convertSwAVFrameToTargetLocked(swSrc, outWidth, outHeight, tightRowBytes,
+                                            outFormat, tmpThumb.data())) {
+            return false;
+        }
+        copyRows(optionalCpuDst, outRowBytes, tmpThumb.data(),
+                 tightRowBytes, tightRowBytes, outHeight, flipVertical);
+        if (outFormat == PixelBufferFormat::BGRA_8u && outWidth <= 640 && outHeight <= 640) {
+            ThumbnailCache::storeBGRA8(filePath_, outWidth, outHeight, frameNumber,
+                                       tmpThumb.data(), tmpThumb.size());
+        }
+        return true;
+    }
+
     auto ramCached = std::make_shared<CachedVideoFrame>();
     ramCached->frameNumber = frameNumber;
     ramCached->width = outWidth;

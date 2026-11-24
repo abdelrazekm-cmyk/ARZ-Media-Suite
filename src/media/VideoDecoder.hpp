@@ -25,7 +25,7 @@ public:
     VideoDecoder(uint64_t sessionId, std::wstring filePath);
     ~VideoDecoder();
 
-    bool open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta);
+    bool open(AVFormatContext* adoptedVideoCtx, MediaMetadata& ioMeta, bool lowResourceThumbnailMode = false);
     void quietHardwareSession();
     void close();
 
@@ -108,6 +108,7 @@ private:
 
     bool usingHardware_ = false;
     bool usingSharedD3D11_ = false;
+    bool lowResourceThumbMode_ = false;
     bool countedInGpuActive_ = false;
     bool quietedFromHardware_ = false;
     bool forceSimulateHwFailure_ = false;
